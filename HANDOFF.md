@@ -1,13 +1,13 @@
-# Session Handoff — 2026-08-17 21:42 (auto-generated)
+# Session Handoff — 2026-08-25 21:55 (auto-generated)
 
 ## Recent commits this session
 
 ```
-4fc677c5 chore: clear lessons promoted into the global standards
-4a08c87b fix: escape perf notes and ignore sse keepalives
-78c3589a feat: expand zip uploads into inboxes
-645a9ca7 fix: harden chat perf sampling diagnostics
-fa59dd3c chore: start 1.9.7 release line
+ce7a3d11 Merge branch 'main' of https://github.com/Maximilien-ai/clawmax
+4ea36c44 test: align plugin discovery with RC45
+b58b6fbe docs: record failed RC44 packaging gate
+57c25960 release: advance review queue to RC45
+aa5278e2 fix: verify packaged QBO schema version
 ```
 
 ## Uncommitted changes at session end
