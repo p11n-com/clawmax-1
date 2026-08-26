@@ -1076,8 +1076,8 @@ fi
 echo ""
 echo -e "${YELLOW}→ Running Plugin relationship helper unit tests...${NC}"
 npx ts-node --transpileOnly client/src/lib/pluginRelationships.test.ts > /tmp/clawmax-plugin-relationships.out 2>&1 || true
-if grep -q "pluginRelationships.test.ts: 4 tests passed" /tmp/clawmax-plugin-relationships.out; then
-  pass "Plugin relationship helper unit tests (4 tests)"
+if grep -q "pluginRelationships.test.ts: 10 tests passed" /tmp/clawmax-plugin-relationships.out; then
+  pass "Plugin relationship helper unit tests (10 tests)"
 else
   cat /tmp/clawmax-plugin-relationships.out
   fail "Plugin relationship helper unit tests"
@@ -1758,8 +1758,8 @@ fi
 
 echo -e "${YELLOW}→ Running Plugin workspace layout regression tests...${NC}"
 npx ts-node --transpileOnly client/src/PluginWorkspaceLayout.test.ts > /tmp/clawmax-plugin-workspace-layout.out 2>&1 || true
-if grep -q "PluginWorkspaceLayout.test.ts: 146 tests passed" /tmp/clawmax-plugin-workspace-layout.out; then
-  pass "Plugin workspace layout regression tests (146 tests)"
+if grep -q "PluginWorkspaceLayout.test.ts: 152 tests passed" /tmp/clawmax-plugin-workspace-layout.out; then
+  pass "Plugin workspace layout regression tests (152 tests)"
 else
   cat /tmp/clawmax-plugin-workspace-layout.out
   fail "Plugin workspace layout regression tests"
@@ -2154,8 +2154,8 @@ fi
 
 echo -e "${YELLOW}→ Running Prompt quality scoring unit tests...${NC}"
 npx ts-node --transpileOnly client/src/lib/promptQuality.test.ts > /tmp/clawmax-prompt-quality.out 2>&1 || true
-if grep -q "promptQuality.test.ts: 10 tests passed" /tmp/clawmax-prompt-quality.out; then
-  pass "Prompt quality scoring unit tests (10 tests)"
+if grep -q "promptQuality.test.ts: 12 tests passed" /tmp/clawmax-prompt-quality.out; then
+  pass "Prompt quality scoring unit tests (12 tests)"
 else
   cat /tmp/clawmax-prompt-quality.out
   fail "Prompt quality scoring unit tests"
@@ -2163,8 +2163,8 @@ fi
 
 echo -e "${YELLOW}→ Running Prompt quality integration regression tests...${NC}"
 npx ts-node --transpileOnly client/src/PromptQualityIntegration.test.ts > /tmp/clawmax-prompt-quality-integration.out 2>&1 || true
-if grep -q "PromptQualityIntegration.test.ts: 32 tests passed" /tmp/clawmax-prompt-quality-integration.out; then
-  pass "Prompt quality integration regression tests (32 tests)"
+if grep -q "PromptQualityIntegration.test.ts: 35 tests passed" /tmp/clawmax-prompt-quality-integration.out; then
+  pass "Prompt quality integration regression tests (35 tests)"
 else
   cat /tmp/clawmax-prompt-quality-integration.out
   fail "Prompt quality integration regression tests"
