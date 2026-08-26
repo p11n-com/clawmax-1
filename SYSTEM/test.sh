@@ -1443,6 +1443,15 @@ else
   fail "BYOK helper unit tests"
 fi
 
+echo -e "${YELLOW}→ Running Agent runtime reload unit tests...${NC}"
+npx ts-node --transpileOnly client/src/lib/agentRuntimeReload.test.ts > /tmp/clawmax-agent-runtime-reload.out 2>&1 || true
+if grep -q "All tests passed" /tmp/clawmax-agent-runtime-reload.out; then
+  agent_runtime_reload_count=$(grep "Tests passed:" /tmp/clawmax-agent-runtime-reload.out | sed 's/\x1b\[[0-9;]*m//g' | sed 's/.*Tests passed: //' | tr -cd '0-9')
+  pass "Agent runtime reload unit tests (${agent_runtime_reload_count:-?} tests)"
+else
+  fail "Agent runtime reload unit tests"
+fi
+
 echo -e "${YELLOW}→ Running Resend test email helper unit tests...${NC}"
 npx ts-node --transpileOnly client/src/lib/resendTestEmail.test.ts > /tmp/clawmax-resend-test-email.out 2>&1 || true
 if grep -q "resendTestEmail.test.ts: ok" /tmp/clawmax-resend-test-email.out; then
@@ -2181,8 +2190,8 @@ fi
 
 echo -e "${YELLOW}→ Running API security boundary tests...${NC}"
 npx ts-node --transpileOnly server/lib/security-boundaries.test.ts > /tmp/clawmax-security-boundaries.out 2>&1 || true
-if grep -q "security-boundaries.test.ts: 52 tests passed" /tmp/clawmax-security-boundaries.out; then
-  pass "API security boundary tests (52 tests)"
+if grep -q "security-boundaries.test.ts: 65 tests passed" /tmp/clawmax-security-boundaries.out; then
+  pass "API security boundary tests (65 tests)"
 else
   cat /tmp/clawmax-security-boundaries.out
   fail "API security boundary tests"
@@ -3145,6 +3154,33 @@ if grep -q "All tests passed" /tmp/clawmax-agent-execution.out; then
   pass "Agent execution runtime unit tests (${agent_execution_count:-?} tests)"
 else
   fail "Agent execution runtime unit tests"
+fi
+
+echo -e "${YELLOW}→ Running Agent runtime adapter unit tests...${NC}"
+npx ts-node --transpileOnly server/lib/agent-runtime.test.ts > /tmp/clawmax-agent-runtime.out 2>&1 || true
+if grep -q "All tests passed" /tmp/clawmax-agent-runtime.out; then
+  agent_runtime_count=$(grep "Tests passed:" /tmp/clawmax-agent-runtime.out | sed 's/\x1b\[[0-9;]*m//g' | sed 's/.*Tests passed: //' | tr -cd '0-9')
+  pass "Agent runtime adapter unit tests (${agent_runtime_count:-?} tests)"
+else
+  fail "Agent runtime adapter unit tests"
+fi
+
+echo -e "${YELLOW}→ Running Runtime session store unit tests...${NC}"
+npx ts-node --transpileOnly server/lib/runtime-sessions.test.ts > /tmp/clawmax-runtime-sessions.out 2>&1 || true
+if grep -q "All tests passed" /tmp/clawmax-runtime-sessions.out; then
+  runtime_sessions_count=$(grep "Tests passed:" /tmp/clawmax-runtime-sessions.out | sed 's/\x1b\[[0-9;]*m//g' | sed 's/.*Tests passed: //' | tr -cd '0-9')
+  pass "Runtime session store unit tests (${runtime_sessions_count:-?} tests)"
+else
+  fail "Runtime session store unit tests"
+fi
+
+echo -e "${YELLOW}→ Running Runtime transcript store unit tests...${NC}"
+npx ts-node --transpileOnly server/lib/runtime-transcripts.test.ts > /tmp/clawmax-runtime-transcripts.out 2>&1 || true
+if grep -q "All tests passed" /tmp/clawmax-runtime-transcripts.out; then
+  runtime_transcripts_count=$(grep "Tests passed:" /tmp/clawmax-runtime-transcripts.out | sed 's/\x1b\[[0-9;]*m//g' | sed 's/.*Tests passed: //' | tr -cd '0-9')
+  pass "Runtime transcript store unit tests (${runtime_transcripts_count:-?} tests)"
+else
+  fail "Runtime transcript store unit tests"
 fi
 
 echo -e "${YELLOW}→ Running Workflow session regression tests...${NC}"
