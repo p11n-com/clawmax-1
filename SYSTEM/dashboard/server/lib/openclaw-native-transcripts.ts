@@ -7,9 +7,21 @@
  * files the rest of the dashboard reads. Fresh OpenClaw 2 agents never get sessions.json or a
  * .jsonl at all, so the dashboard chat history routes need this as a fallback read path.
  *
- * This module never writes to the database (the OpenClaw runtime owns it), always closes the
- * handle it opens, and never throws into a caller — a missing file, missing table, or malformed
- * row degrades to an empty result rather than a 500.
+ * This module never writes to the database's own tables — the OpenClaw runtime owns them — and
+ * never throws into a caller: a missing file, missing table, or malformed row degrades to an
+ * empty result rather than a 500. One caveat: opening a WAL-mode database read-only (the mode
+ * OpenClaw's Gateway uses) can create/touch companion `-wal`/`-shm` index files next to it, which
+ * a read-only close does not remove — this is standard SQLite WAL-reader behavior, not specific to
+ * this module (`hasReadyOpenClawNativeAgentStore` in agent-execution.ts already does the same
+ * read-only open on every chat turn today), and those files hold none of our data. Opening with
+ * `?immutable=1` avoids creating them, but was measured to silently read stale/missing data
+ * whenever the Gateway has written to the WAL without checkpointing yet — exactly the case that
+ * matters most for an actively-chatting agent — so it is deliberately not used here.
+ *
+ * Clearing a native-only chat cannot delete the runtime's rows (same reason), so this module also
+ * owns a small dashboard-side watermark sidecar (sessions/native-clear-watermarks.json, next to the
+ * sessions.json index the legacy store already keeps there) recording the highest `seq` archived
+ * per session id. Reads below the watermark are treated as already cleared.
  *
  * Tables (as written by OpenClaw 2's Gateway process):
  *  - session_nodes(session_key, current_session_id, entry_json, updated_at, ...)
@@ -74,6 +86,7 @@ function parseEntryJsonField(entryJson: string | null | undefined, field: 'sessi
 /**
  * All sessions recorded for this agent, newest first. Reads `session_nodes` when present, falling
  * back to `session_windows`. Returns [] for a missing/unreadable store or one with neither table.
+ * Not watermark-aware — this answers "what sessions exist", not "what's left to show".
  */
 export function listNativeSessionIds(agentId: string, homeDir: string = process.env.HOME || ''): NativeSessionSummary[] {
   const database = openNativeStoreReadOnly(nativeAgentStorePath(agentId, homeDir))
@@ -122,9 +135,75 @@ export function listNativeSessionIds(agentId: string, homeDir: string = process.
   }
 }
 
+// --- Dashboard-owned "cleared" watermark -----------------------------------------------------
+// Clear can't delete the runtime's rows, so it records how far it archived instead. Lives next to
+// sessions.json in the same directory — dashboard bookkeeping, never touches the SQLite file.
+
+interface NativeClearWatermarks {
+  [sessionId: string]: { seq: number; clearedAt: number }
+}
+
+function getNativeClearWatermarksPath(agentId: string, homeDir: string): string {
+  return path.join(homeDir, '.openclaw', 'agents', agentId, 'sessions', 'native-clear-watermarks.json')
+}
+
+function readNativeClearWatermarkSeq(agentId: string, sessionId: string, homeDir: string): number {
+  try {
+    const watermarks = JSON.parse(fs.readFileSync(getNativeClearWatermarksPath(agentId, homeDir), 'utf-8')) as NativeClearWatermarks
+    const seq = watermarks?.[sessionId]?.seq
+    return typeof seq === 'number' ? seq : -1
+  } catch {
+    return -1
+  }
+}
+
 /**
- * Raw transcript lines for one session, oldest first (ordered by `seq`). Each returned string is
- * exactly one legacy-format JSONL line — callers parse them the same way they parse a `.jsonl`
+ * Advance the "cleared through" watermark for one session to its current highest `seq`. Called by
+ * Clear after archiving whatever native content it just read. A later call to
+ * `readNativeTranscriptLines`/`hasNativeTranscript` for this session then only sees events with a
+ * higher `seq` — i.e. turns that happened after this Clear — without ever touching the runtime's
+ * database. A session with nothing recorded (or an unreadable store) is a no-op.
+ */
+export function markNativeTranscriptCleared(agentId: string, sessionId: string, homeDir: string = process.env.HOME || ''): void {
+  if (!sessionId) return
+  const database = openNativeStoreReadOnly(nativeAgentStorePath(agentId, homeDir))
+  if (!database) return
+
+  let maxSeq: number | null = null
+  try {
+    if (tableExists(database, 'transcript_events')) {
+      const row = database.prepare(
+        'SELECT MAX(seq) AS maxSeq FROM transcript_events WHERE session_id = ?'
+      ).get(sessionId) as { maxSeq: number | null } | undefined
+      maxSeq = typeof row?.maxSeq === 'number' ? row.maxSeq : null
+    }
+  } catch {
+    maxSeq = null
+  } finally {
+    closeQuietly(database)
+  }
+  if (maxSeq === null) return
+
+  const watermarksPath = getNativeClearWatermarksPath(agentId, homeDir)
+  let watermarks: NativeClearWatermarks = {}
+  try {
+    watermarks = JSON.parse(fs.readFileSync(watermarksPath, 'utf-8'))
+  } catch {
+    // no existing sidecar (or unreadable) — start fresh
+  }
+  watermarks[sessionId] = { seq: maxSeq, clearedAt: Date.now() }
+  try {
+    fs.mkdirSync(path.dirname(watermarksPath), { recursive: true })
+    fs.writeFileSync(watermarksPath, JSON.stringify(watermarks, null, 2))
+  } catch {
+    // best-effort — a failed watermark write just means Clear didn't fully hide the old content
+  }
+}
+
+/**
+ * Raw transcript lines for one session, oldest first (ordered by `seq`), excluding anything at or
+ * below that session's clear watermark (see `markNativeTranscriptCleared`). Each returned string
+ * is exactly one legacy-format JSONL line — callers parse them the same way they parse a `.jsonl`
  * file's lines (e.g. `parseVisibleChatMessages`).
  */
 export function readNativeTranscriptLines(agentId: string, sessionId: string, homeDir: string = process.env.HOME || ''): string[] {
@@ -134,9 +213,10 @@ export function readNativeTranscriptLines(agentId: string, sessionId: string, ho
 
   try {
     if (!tableExists(database, 'transcript_events')) return []
+    const watermarkSeq = readNativeClearWatermarkSeq(agentId, sessionId, homeDir)
     const rows = database.prepare(
-      'SELECT event_json FROM transcript_events WHERE session_id = ? ORDER BY seq ASC'
-    ).all(sessionId) as Array<{ event_json: string | null }>
+      'SELECT event_json FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq ASC'
+    ).all(sessionId, watermarkSeq) as Array<{ event_json: string | null }>
     return rows
       .map((row) => row.event_json)
       .filter((line): line is string => typeof line === 'string' && line.length > 0)
@@ -147,7 +227,11 @@ export function readNativeTranscriptLines(agentId: string, sessionId: string, ho
   }
 }
 
-/** Cheap existence check for one session's transcript, without reading its rows. */
+/**
+ * Cheap existence check for one session's transcript, without reading its rows. Watermark-aware
+ * like `readNativeTranscriptLines` — a fully cleared session with nothing since reports false,
+ * mirroring the legacy store (Clear deletes the `.jsonl`, so `hasSessionFile` goes false too).
+ */
 export function hasNativeTranscript(agentId: string, sessionId: string, homeDir: string = process.env.HOME || ''): boolean {
   if (!sessionId) return false
   const database = openNativeStoreReadOnly(nativeAgentStorePath(agentId, homeDir))
@@ -155,9 +239,10 @@ export function hasNativeTranscript(agentId: string, sessionId: string, homeDir:
 
   try {
     if (!tableExists(database, 'transcript_events')) return false
+    const watermarkSeq = readNativeClearWatermarkSeq(agentId, sessionId, homeDir)
     return Boolean(database.prepare(
-      'SELECT 1 FROM transcript_events WHERE session_id = ? LIMIT 1'
-    ).get(sessionId))
+      'SELECT 1 FROM transcript_events WHERE session_id = ? AND seq > ? LIMIT 1'
+    ).get(sessionId, watermarkSeq))
   } catch {
     return false
   } finally {
