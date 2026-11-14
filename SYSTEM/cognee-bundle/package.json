@@ -3,6 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "@cognee/cognee-openclaw": "2026.9.2"
+    "@cognee/cognee-openclaw": "2026.10.13"
+  },
+  "overrides": {
+    "@cognee/cognee-openclaw": {
+      "undici": "7.30.1"
+    }
   }
 }

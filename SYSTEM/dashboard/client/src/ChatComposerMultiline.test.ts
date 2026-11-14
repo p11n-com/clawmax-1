@@ -27,10 +27,13 @@ for (const [name, source] of [
   assert(source.includes('resize-y'), `${name} must allow manual resizing`)
   assert(source.includes('aria-expanded={composerExpanded}'), `${name} must expose expansion state`)
   assert(source.includes('Collapse message box') && source.includes('Expand message box'), `${name} must name both chevron actions`)
+  assert(source.includes("composerExpanded ? '' : 'rotate-180'"), `${name} must show an upward chevron when compact and a downward chevron when expanded`)
+  assert(source.includes('useState(readChatComposerExpanded)'), `${name} must restore the saved composer size`)
+  assert(source.includes('saveChatComposerExpanded(next)'), `${name} must save both chevron choices`)
 }
 
 assert(agentChatSource.includes("!input.includes('\\n')"), 'Multiline agent chat must preserve native arrow-key navigation')
 assert(detailSource.includes('Press Esc to close details'), 'Agent detail must disclose the Escape shortcut')
 assert(detailSource.includes('else if (editingCostLimit)'), 'Escape must dismiss inline budget editing before closing details')
 
-console.log('ChatComposerMultiline.test.ts: compact and expandable composers and detail shortcut passed')
+console.log('ChatComposerMultiline.test.ts: 39 assertions passed')

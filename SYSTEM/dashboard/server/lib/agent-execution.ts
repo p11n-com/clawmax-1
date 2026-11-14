@@ -16,6 +16,7 @@ import { getAvailableModelsCached, getCachedOpenAiCompatibleContextWindow, resol
 import { isPinnedRuntimeDisabled, resolveAgentRuntime, type AgentRuntimeId } from './agent-runtime'
 import { materializeDashboardAgentList, writeDashboardManagedOpenClawConfig } from './openclaw-config'
 import { getGatewayClient, isGatewayRunning } from './gateway-rpc'
+import { readRuntimeTranscript } from './runtime-transcripts'
 
 interface OpenClawAgentRecord {
   id: string
@@ -429,29 +430,48 @@ export function deriveWorkspaceRootFromAgentWorkspace(agentWorkspace?: string): 
   return normalized
 }
 
-export function scopeSessionIdToModel(sessionId: string, model?: string): string {
-  const MAX_SESSION_KEY_LENGTH = 48
+function scopedSessionParts(sessionId: string, model?: string) {
   const safeBase = sessionId.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
   const modelToken = (model || '').replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 24)
   const base = safeBase || 'chat'
-  const combined = modelToken ? `${base}-${modelToken}` : base
+  return { base, combined: modelToken ? `${base}-${modelToken}` : base }
+}
+
+function scopedSessionIdWithDigest(sessionId: string, model: string | undefined, algorithm: 'sha1' | 'sha256', digestLength: number): string {
+  const MAX_SESSION_KEY_LENGTH = 48
+  const { base, combined } = scopedSessionParts(sessionId, model)
 
   if (combined.length <= MAX_SESSION_KEY_LENGTH) {
     return combined
   }
 
-  const hash = createHash('sha1').update(combined).digest('hex').slice(0, 8)
+  const hash = createHash(algorithm).update(combined).digest('hex').slice(0, digestLength)
   const trimmedBase = base.slice(0, Math.max(8, MAX_SESSION_KEY_LENGTH - hash.length - 1))
   return `${trimmedBase}-${hash}`.slice(0, MAX_SESSION_KEY_LENGTH)
+}
+
+export function scopeSessionIdToModel(sessionId: string, model?: string): string {
+  return scopedSessionIdWithDigest(sessionId, model, 'sha256', 16)
+}
+
+/** Only continue an old hashed session when the caller supplies a server-generated seed. */
+export function scopeStoredDashboardSessionId(agentId: string, sessionSeed: string, model?: string, homeDir?: string): string {
+  const current = scopeSessionIdToModel(sessionSeed, model)
+  const legacy = scopedSessionIdWithDigest(sessionSeed, model, 'sha1', 8)
+  if (current === legacy || homeDir === '' || !/^[a-zA-Z0-9_-]+$/.test(agentId)) return current
+  if (hasNativeChatSession(agentId, legacy, homeDir)) return legacy
+  const legacyFile = path.join(openClawStatePath(homeDir), 'agents', agentId, 'sessions', `${legacy}.jsonl`)
+  if (fs.existsSync(legacyFile) || readRuntimeTranscript(agentId, legacy).length > 0) return legacy
+  return current
 }
 
 export function resolvePersistedAgentSessionId(
   agentId: string,
   sessionKey: string,
   preferredSessionId?: string,
-  homeDir: string = process.env.HOME || ''
+  homeDir?: string
 ): string | undefined {
-  if (!agentId || !homeDir) return preferredSessionId
+  if (!agentId || homeDir === '') return preferredSessionId
 
   // The session a turn ran, when the runtime has it. A key migrated from the legacy dashboard-chat
   // index keeps pointing at the conversation it held then, which is no longer this one once the chat
@@ -460,7 +480,7 @@ export function resolvePersistedAgentSessionId(
   const nativeSession = resolveNativeChatSession(agentId, sessionKey, homeDir)
   if (nativeSession) return nativeSession
 
-  const sessionsDir = path.join(homeDir, '.openclaw', 'agents', agentId, 'sessions')
+  const sessionsDir = path.join(openClawStatePath(homeDir), 'agents', agentId, 'sessions')
   const sessionsIndexPath = path.join(sessionsDir, 'sessions.json')
 
   const hasSessionFile = (sessionId: string | undefined): sessionId is string =>
@@ -514,7 +534,7 @@ export function resolvePersistedAgentSessionId(
  * A session's persisted transcript lines: the native agent store when it holds the session (OpenClaw
  * 2 records `--session-id` turns there and writes no JSONL), otherwise the legacy JSONL file.
  */
-function readPersistedSessionLines(agentId: string, sessionId: string, homeDir: string): string[] | null {
+function readPersistedSessionLines(agentId: string, sessionId: string, homeDir?: string): string[] | null {
   let transcript: string | undefined
   try {
     transcript = readPersistedChatTranscript(agentId, sessionId, homeDir)
@@ -531,7 +551,7 @@ export function readLatestAssistantUsageFromPersistedSession(
   agentId: string,
   sessionKey: string,
   preferredSessionId?: string,
-  homeDir: string = process.env.HOME || ''
+  homeDir?: string
 ): {
   sessionId?: string
   inputTokens?: number
@@ -542,7 +562,7 @@ export function readLatestAssistantUsageFromPersistedSession(
   provider?: string
 } | null {
   const sessionId = resolvePersistedAgentSessionId(agentId, sessionKey, preferredSessionId, homeDir)
-  if (!sessionId || !homeDir) return null
+  if (!sessionId || homeDir === '') return null
 
   const lines = readPersistedSessionLines(agentId, sessionId, homeDir)
   if (!lines) return null
@@ -572,7 +592,7 @@ export function readLatestAssistantTextFromPersistedSession(
   agentId: string,
   sessionKey: string,
   preferredSessionId?: string,
-  homeDir: string = process.env.HOME || ''
+  homeDir?: string
 ): {
   sessionId?: string
   content?: string
@@ -580,7 +600,7 @@ export function readLatestAssistantTextFromPersistedSession(
   messageId?: string
 } | null {
   const sessionId = resolvePersistedAgentSessionId(agentId, sessionKey, preferredSessionId, homeDir)
-  if (!sessionId || !homeDir) return null
+  if (!sessionId || homeDir === '') return null
 
   const lines = readPersistedSessionLines(agentId, sessionId, homeDir)
   if (!lines) return null
@@ -1494,7 +1514,7 @@ export async function withTemporaryAgentAuthProfiles<T>(
   let effectiveProvider = preferredProvider
   const prefersOpenAiFamily = preferredProvider === 'openai'
   if (preferredProvider === 'anthropic' && !providerKeys.anthropic && providerKeys.openai) {
-    effectiveModel = 'openai/gpt-4.1'
+    effectiveModel = normalizeAgentModelInput('openai/gpt-4.1')
     effectiveProvider = 'openai'
     console.log(`[Auth] Agent ${agentId}: no Anthropic key, falling back to ${effectiveModel}`)
   } else if (prefersOpenAiFamily && !providerKeys.openai && !providerKeys.openaiCompatibleBaseUrl && providerKeys.anthropic) {
@@ -1502,7 +1522,7 @@ export async function withTemporaryAgentAuthProfiles<T>(
     effectiveProvider = 'anthropic'
     console.log(`[Auth] Agent ${agentId}: no OpenAI key, falling back to ${effectiveModel}`)
   } else if (preferredProvider === 'gemini' && !providerKeys.gemini && providerKeys.openai) {
-    effectiveModel = 'openai/gpt-4.1'
+    effectiveModel = normalizeAgentModelInput('openai/gpt-4.1')
     effectiveProvider = 'openai'
     console.log(`[Auth] Agent ${agentId}: no Gemini key, falling back to ${effectiveModel}`)
   } else if (preferredProvider === 'gemini' && !providerKeys.gemini && providerKeys.anthropic) {

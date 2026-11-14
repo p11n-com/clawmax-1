@@ -1,3 +1,5 @@
+import { getRequestByokKeys, withRequestByokKeys, setRequestByokKeys as setContextKeys } from './ai-generation-context'
+export function setRequestByokKeys(keys: ProviderKeys | undefined): void { setContextKeys(keys) }
 import OpenAI from 'openai'
 import { AsyncLocalStorage } from 'async_hooks'
 import { resolveSystemExecutionProviderKeys, resolveUserExecutionProviderKeys, ProviderKeys } from './dashboard-env'
@@ -7,12 +9,14 @@ import { readWorkspaceIntegrationConfig } from './workspace-integrations'
 import { CLAUDE_MODEL_ALIASES, executeAgentRuntimeTurn, resolveEnabledRuntimes, resolveRuntimeCliPath, type AgentRuntimeId, isRuntimeCancelledError } from './agent-runtime'
 import { withRegisteredTurn } from './agent-turns'
 import { getModelLifecycleEntry } from './openAiModelLifecycle'
+import { resolveActiveOpenAIModel } from './openai-model-retirements'
+import { normalizeGeneratedWorkflowDraft } from './workflow-content'
 import { randomUUID } from 'crypto'
 import { getWorkspacePath } from './workspace'
 
 type AIProvider = 'openai' | 'openai-compatible' | 'anthropic' | 'gemini' | 'cli-runtime'
 export type TemplateGenerationTarget = 'agent' | 'team' | 'company'
-export type PromptExpansionTarget = 'agent' | 'workflow' | 'skill' | 'template'
+export type PromptExpansionTarget = 'agent' | 'workflow' | 'skill' | 'template' | 'group' | 'community'
 export type PromptExpansionFormat = 'markdown' | 'text'
 export type PromptExpansionGuidance = string
 export const TEMPLATE_GENERATION_TIMEOUT_MS = 180000
@@ -107,7 +111,7 @@ export function normalizeTemplateGenerationTarget(value: unknown): TemplateGener
 }
 
 export function normalizePromptExpansionTarget(value: unknown): PromptExpansionTarget {
-  return value === 'agent' || value === 'workflow' || value === 'skill' ? value : 'template'
+  return value === 'agent' || value === 'workflow' || value === 'skill' || value === 'group' || value === 'community' ? value : 'template'
 }
 
 export function normalizePromptExpansionFormat(value: unknown): PromptExpansionFormat {
@@ -122,6 +126,8 @@ export function buildPromptExpansionSystemPrompt(
   const targetLabel = {
     agent: 'AI agent',
     workflow: 'workflow',
+    group: 'agent group',
+    community: 'agent community',
     skill: 'skill',
     template: 'template',
   }[target]
@@ -494,41 +500,38 @@ function getAvailableProvider(
   // whole request over a stale browser-stored key the run was never going to use — the opposite
   // of "a CLI runtime needs no provider key".
   validateAiGenerationProviderKeys(byokKeys)
+  // Neither a typed nor a discovered model is available yet. Do not let an
+  // untouched compatible URL displace a usable provider.
+  let incompleteCompatible: { provider: AIProvider; key: string; baseUrl?: string; defaultModel?: string } | undefined
   // Try BYOK keys first (passed from client request)
   if (byokKeys?.openai) return { provider: 'openai', key: byokKeys.openai }
   if (byokKeys?.openaiCompatibleBaseUrl) {
-    // A base URL with no model at all — none typed, and none discovered at the endpoint — cannot
-    // generate. Prefer an enabled CLI runtime over dead-ending, rather than letting the unusable
-    // endpoint win just because it is configured.
-    // compatibleDefaults already resolved this endpoint together with its own key and model.
-    const compatibleModel = String(compatibleDefaults.defaultModel || '').trim()
-    const cliInstead = compatibleModel ? undefined : cliCandidate()
-    if (cliInstead) return { provider: 'cli-runtime', key: cliInstead }
-    return {
-      provider: 'openai-compatible',
-      // compatibleDefaults selected the browser's endpoint and paired it with the credential that
-      // belongs to that server — the browser's own key, or the protected one configured for it.
-      key: compatibleDefaults.apiKey || 'openai-compatible',
-      baseUrl: compatibleDefaults.baseUrl || byokKeys.openaiCompatibleBaseUrl,
-      defaultModel: compatibleModel || undefined,
+    const endpoint = resolveOpenAiCompatibleEndpoint([
+      openAiCompatibleCandidateFromKeys(byokKeys), compatibleDefaults,
+    ])!
+    const selection = {
+      provider: 'openai-compatible' as const,
+      key: endpoint.apiKey || 'openai-compatible',
+      baseUrl: endpoint.baseUrl,
+      defaultModel: endpoint.defaultModel,
     }
+    if (String(selection.defaultModel || '').trim()) return selection
+    incompleteCompatible = selection
   }
   if (byokKeys?.anthropic) return { provider: 'anthropic', key: byokKeys.anthropic }
   if (byokKeys?.gemini) return { provider: 'gemini', key: byokKeys.gemini }
   // Then system/user-default keys
   const keys = options.systemKeys ?? resolveSystemExecutionProviderKeys(options.rawEnv)
   if (keys.openai) return { provider: 'openai', key: keys.openai }
-  if (compatibleDefaults.baseUrl) {
-    const cliInstead = String(compatibleDefaults.defaultModel || '').trim() ? undefined : cliCandidate()
-    if (cliInstead) return { provider: 'cli-runtime', key: cliInstead }
-    return {
-      provider: 'openai-compatible',
-      // compatibleDefaults carries the key belonging to the endpoint it selected. Reaching for the
-      // system key here sent one endpoint's secret to a different endpoint's URL.
+  if (compatibleDefaults.baseUrl && !byokKeys?.openaiCompatibleBaseUrl) {
+    const selection = {
+      provider: 'openai-compatible' as const,
       key: compatibleDefaults.apiKey || 'openai-compatible',
       baseUrl: compatibleDefaults.baseUrl,
       defaultModel: compatibleDefaults.defaultModel,
     }
+    if (String(compatibleDefaults.defaultModel || '').trim()) return selection
+    incompleteCompatible ??= selection
   }
   if (keys.anthropic) return { provider: 'anthropic', key: keys.anthropic }
   if (keys.gemini) return { provider: 'gemini', key: keys.gemini }
@@ -537,6 +540,7 @@ function getAvailableProvider(
   // it is what the operator explicitly turned on.
   const enabledRuntime = cliCandidate()
   if (enabledRuntime) return { provider: 'cli-runtime', key: enabledRuntime }
+  if (incompleteCompatible) return incompleteCompatible
   throw new Error('No API key configured. Set SYSTEM_OPENAI_API_KEY, SYSTEM_ANTHROPIC_API_KEY, or SYSTEM_GEMINI_API_KEY in .env, enable a CLI runtime in BYOK, or provide a BYOK key.')
 }
 
@@ -955,32 +959,10 @@ export function getAIClient(byokKeys?: ProviderKeys): { client: OpenAI; model: s
   return { client: wrapped as unknown as OpenAI, model: built.model }
 }
 
-// BYOK keys for the request being served. Each HTTP request runs inside its own async scope
-// (requestByokScopeMiddleware), so a route's setRequestByokKeys is visible only to the work that
-// request awaits — two concurrent generations can never read each other's credentials. Outside a
-// request scope (tests, scripts) the setter falls back to a process-wide slot as before.
-const requestByokStore = new AsyncLocalStorage<{ keys: ProviderKeys | undefined }>()
-let _requestByokKeys: ProviderKeys | undefined
-
-export function setRequestByokKeys(keys: ProviderKeys | undefined) {
-  const scope = requestByokStore.getStore()
-  if (scope) scope.keys = keys
-  else _requestByokKeys = keys
-}
-
-export function getRequestByokKeys(): ProviderKeys | undefined {
-  const scope = requestByokStore.getStore()
-  return scope ? scope.keys : _requestByokKeys
-}
-
-/** Runs fn inside its own BYOK scope; setRequestByokKeys within it cannot leak to other callers. */
+// Reuse the host's request-scoped context; never restore a process-wide key slot.
+export { getRequestByokKeys, aiGenerationRequestContext as requestByokScopeMiddleware } from './ai-generation-context'
 export function withRequestByokScope<T>(fn: () => T): T {
-  return requestByokStore.run({ keys: undefined }, fn)
-}
-
-/** Express middleware: every request gets its own BYOK scope. */
-export function requestByokScopeMiddleware(_req: unknown, _res: unknown, next: () => void) {
-  requestByokStore.run({ keys: undefined }, () => next())
+  return withRequestByokKeys(undefined, fn)
 }
 
 /**
@@ -1100,8 +1082,10 @@ function resolveModel(requestedModel: string, providerOverride?: AIProvider, byo
   }
   const anthropicModel = getPreferredAnthropicGenerationModel()
   const preferredForProvider = resolveSystemGenerationModelForProvider(provider, systemPreferredModel, anthropicModel)
-  if (preferredForProvider) return preferredForProvider
-  if (provider === 'openai') return requestedModel
+  if (preferredForProvider) return provider === 'openai'
+    ? resolveActiveOpenAIModel(`openai/${preferredForProvider}`).replace(/^openai\//, '')
+    : preferredForProvider
+  if (provider === 'openai') return resolveActiveOpenAIModel(`openai/${requestedModel.replace(/^openai\//, '')}`).replace(/^openai\//, '')
   if (provider === 'gemini') return 'gemini-2.5-flash'
   // Map OpenAI models to Anthropic equivalents
   if (requestedModel.includes('gpt-4o-mini') || requestedModel.includes('gpt-4')) return anthropicModel
@@ -1120,7 +1104,7 @@ function stripProviderPrefix(model: string): string {
 export function shouldUseMaxCompletionTokens(model: string): boolean {
   if (model === CLI_RUNTIME_MODEL_SENTINEL) return false
   const { provider } = getAvailableProvider(getRequestByokKeys())
-  return provider === 'openai' && /^gpt-5(?:-|$)/i.test(stripProviderPrefix(model))
+  return provider === 'openai' && /^gpt-[56](?:[.-]|$)/i.test(stripProviderPrefix(model))
 }
 
 function shouldOmitTemperature(model: string): boolean {
@@ -1263,8 +1247,11 @@ interface GeneratedFiles {
 export function extractJsonResponseText(raw: string): string {
   const trimmed = raw.trim()
   if (!trimmed) return '{}'
-  const jsonMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, trimmed]
-  return (jsonMatch[1] || trimmed).trim()
+  // A valid JSON string may itself contain Markdown fences. Never extract those
+  // as if they wrapped the provider response (workflow sample inputs commonly do).
+  try { JSON.parse(trimmed); return trimmed } catch { /* Try an outer fence only. */ }
+  const outer = trimmed.match(/^```(?:json)?\s*\n?([\s\S]*)\n?```\s*$/i)
+  return outer ? outer[1].trim() : trimmed
 }
 
 export function parseJsonResponse<T>(raw: string, fallback: T): T {
@@ -2319,6 +2306,40 @@ export async function generateArchiveTitle(messages: Message[]): Promise<string>
 /**
  * Generate a workflow definition from natural language description.
  */
+export async function generateChannelDraft(input: {
+  kind: 'group' | 'community'; description: string;
+  agents: Array<{ id: string; tags: string[] }>; communities: string[];
+}, keys?: ProviderKeys) {
+  const { client, model } = getAIClient(keys)
+  const completion = await createChatCompletionWithCompatibilityRetry(client, {
+    model,
+    messages: [
+      { role: 'system', content: `Generate a ClawMax ${input.kind} draft for review. Return only JSON with name (short plain text), description (plain text), members (array of existing agent IDs), and community (optional existing community name, only for groups). Never invent agents or communities. Select members relevant to the request; select all only when requested. Do not claim anything was saved. Available agents: ${JSON.stringify(input.agents)}. Available communities: ${JSON.stringify(input.communities)}.` },
+      { role: 'user', content: input.description },
+    ],
+    temperature: 0.3,
+  })
+  let draft: any
+  try { draft = JSON.parse(extractJsonResponseText(completion.choices[0].message.content || '')) }
+  catch { throw new Error('AI returned an unreadable draft. Your prompt is preserved; try again.') }
+  return normalizeChannelDraft(draft, input)
+}
+
+export function normalizeChannelDraft(draft: any, input: {
+  kind: 'group' | 'community'; agents: Array<{ id: string }>; communities: string[];
+}) {
+  if (!draft || typeof draft.name !== 'string' || !draft.name.trim() || /[\r\n]/.test(draft.name) || draft.name.length > 120) {
+    throw new Error('AI returned an invalid name. Your prompt is preserved; try again.')
+  }
+  if (typeof draft.description !== 'string' || !draft.description.trim()) throw new Error('AI returned no description. Your prompt is preserved; try again.')
+  const ids = new Set(input.agents.map(agent => agent.id))
+  if (!Array.isArray(draft.members) || draft.members.some((id: unknown) => typeof id !== 'string' || !ids.has(id))) {
+    throw new Error('AI selected unavailable agents. Your prompt is preserved; try again.')
+  }
+  if (input.kind === 'group' && draft.community && !input.communities.includes(draft.community)) throw new Error('AI selected an unavailable community. Your prompt is preserved; try again.')
+  return { name: draft.name.trim(), description: draft.description.trim(), members: [...new Set<string>(draft.members)], community: input.kind === 'group' ? draft.community || '' : '' }
+}
+
 export async function generateWorkflowFromNL(description: string, availableAgents: string[], availableTags: string[]): Promise<any> {
   getAvailableProvider(getRequestByokKeys())
 
@@ -2339,12 +2360,14 @@ A workflow has:
 - description: what the workflow does
 - schedule: a cron expression (e.g., "0 9 * * 1-5" for weekdays at 9am) or "manual"
 - executionMode: "automated" (agents run independently) or "managed" (sequential with coordination)
+- owner: REQUIRED for managed workflows; choose one real available agent ID, preferably a selected participant. Omit for automated workflows.
+- When the user requests all workspace agents, include every available agent ID in targeting.agents. Never invent agent IDs or select only a subset via tags.
 - targeting: which agents participate, defined by:
   - agents: array of agent IDs from the available list
   - tags: array of agent tags from the available list
   - groups: array of group names
   - communities: array of community names
-- content: the detailed instruction/prompt that agents will receive when the workflow runs
+- content: a nonempty Markdown STRING containing the detailed instructions agents receive when the workflow runs. Use JSON-escaped newlines. Never return an object or array in this field.
 
 Respond with ONLY valid JSON, no markdown fences or explanation.`
       },
@@ -2359,11 +2382,13 @@ Respond with ONLY valid JSON, no markdown fences or explanation.`
   const raw = completion.choices[0].message.content?.trim() || ''
   const jsonStr = extractJsonResponseText(raw)
 
+  let draft
   try {
-    return JSON.parse(jsonStr)
+    draft = JSON.parse(jsonStr)
   } catch {
-    throw new Error(`Generated output is not valid JSON: ${jsonStr.slice(0, 200)}`)
+    throw new Error('Generated workflow is not valid JSON. Your prompt is preserved; generate again.')
   }
+  return normalizeGeneratedWorkflowDraft(draft)
 }
 
 /**
@@ -2942,7 +2967,7 @@ export async function generateCronFromText(text: string, timezone?: string): Pro
   // is the same check every other generator in this file relies on to decide whether *any*
   // execution path — request-scoped BYOK, workspace/system default, or CLI runtime — is usable.
   try {
-    getAvailableProvider(_requestByokKeys)
+    getAvailableProvider(getRequestByokKeys())
   } catch (err: any) {
     return { cron: '', explanation: '', error: err?.message || 'No OpenAI API key or CLI runtime configured' }
   }

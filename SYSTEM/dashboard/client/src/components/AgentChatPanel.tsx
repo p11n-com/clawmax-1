@@ -1,32 +1,47 @@
+import { ScrollableMarkdownTable } from './ScrollableMarkdownTable'
 import { channelLabel } from '../lib/channelLabel'
-import { useEffect, useLayoutEffect, useState, useRef, useCallback, type ChangeEvent } from 'react'
+import { useEffect, useLayoutEffect, useState, useRef, useCallback, type ChangeEvent, type KeyboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { nextChatFollowState } from '../lib/agentChatScroll'
 import { byokForRequest, hasChatExecutionAccess, readStoredByokKeys } from '../lib/byok'
 import { buildPersistentDashboardChatSessionId, resolveDashboardChatSessionId } from '../lib/agentChatSession'
 import { buildAgentChatTimelineRows, shouldShowCalendarDate } from '../lib/agentChatTimeline'
-import { getAgentChatCodeBlockClassName, getAgentChatInlineCodeClassName, getAgentChatLinkClassName, type AgentChatMarkdownRole } from '../lib/agentChatMarkdown'
+import { getAgentChatInlineCodeClassName, getAgentChatLinkClassName, isCodeBlockNode, type AgentChatMarkdownRole } from '../lib/agentChatMarkdown'
+import { copyText } from '../lib/clipboard'
+import { AssistantCodeBlock, CopyIcon, UserCodeBlock } from './ChatCodeBlock'
 import { ProductIconCell } from '../lib/productIcons'
 import { useAuth } from '../contexts/AuthContext'
 import { resolveAgentChatDocPath } from '../lib/agentChatDocs'
 import { forwardChatMessage, loadForwardTargets, type ForwardTarget } from '../lib/agentChatForward'
+import { useDismissiblePopover } from '../lib/dismissiblePopover'
+import { useAgentPanelPersistence } from '../lib/agentPanelPersistence'
+import { KeepAgentPanelOpenButton } from './KeepAgentPanelOpenButton'
 import { appendAgentInboxAttachmentContext, buildAgentInboxDisplayMessage, buildAgentInboxTargetPath, type AgentInboxAttachmentRef } from '../lib/agentInbox'
 import { transformWorkspaceMarkdownUrl } from '../lib/markdownLinks'
+import { normalizeChatMessage } from '../../../server/lib/chat-normalization'
 import { createPromptAttachment } from '../lib/promptAttachments'
 import { extractWorkspaceFileMentions, linkifyWorkspaceFiles, parseWorkspaceDocEntriesResponse } from '../lib/workspaceFiles'
-import { formatAgentWorkStatus, summarizeAgentChatFailure } from '../lib/chatRuntimeErrors'
+import { formatAgentWorkStatus, isRuntimeDiagnosticText, summarizeAgentChatFailure } from '../lib/chatRuntimeErrors'
 import { INCOMPLETE_AGENT_CHAT_MESSAGE, markIncompleteAgentReply } from '../lib/agentChatStream'
 import { buildAgentChatMarkdown, getAgentChatDownloadState } from '../lib/agentChatExport'
+import { parseAgentChatHistory, reconcileAgentChatHistory } from '../lib/agentChatHistory'
 import { useToast } from './Toast'
 import { AgentAttention } from './AgentAttention'
 import { shouldSendChatOnKeyDown } from '../lib/chatComposer'
+import { readChatComposerExpanded, saveChatComposerExpanded } from '../lib/chatComposerSize'
 
 interface Message {
   role: 'user' | 'assistant'
   content: string
+  /** A reply bubble this tab filled with a failure summary instead of the agent's text. */
+  failed?: boolean
   timestamp: number
   id: string
+  /** Sent or received by this tab and not yet confirmed by the persisted transcript. */
+  pending?: boolean
+  /** For a pending user message: the text the agent received, when it differs from what is shown. */
+  sentContent?: string
 }
 
 type ForwardTargetsState = { status: 'idle' | 'loading' | 'ready' | 'error'; targets: ForwardTarget[]; error?: string }
@@ -80,117 +95,13 @@ function stripAnsi(str: string): string {
   return str.replace(/\x1b\[[0-9;]*m/g, '').replace(/\[[\d;]*m/g, '')
 }
 
-// Detect if content is an error/diagnostic message
-function isErrorContent(content: string): boolean {
-  return /\[diagnostic\]|lane task error|session file locked|Error:|error="/i.test(content)
-}
-
-function isRuntimeStatusLine(trimmed: string): boolean {
-  return /^(🕒|🧠|🔑|🧮|📚|🧹|🧵|⚙️|🪢)\s/.test(trimmed)
-}
-
-function isToolArtifactLine(trimmed: string): boolean {
-  return (
-    trimmed === '(processing...)' ||
-    trimmed === 'Files:' ||
-    /^total\s+\d+/.test(trimmed) ||
-    /^[drwx-]{10}\s/.test(trimmed) ||
-    /^-rw[rx-]{7}\s/.test(trimmed) ||
-    /^[A-Za-z0-9_.-]+\.(md|txt|json|csv|pdf|html|yml|yaml)$/.test(trimmed) ||
-    /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ||
-    trimmed === 'No notes yet.'
-  )
-}
-
-// Strip OpenClaw internal data from message content
+// Persisted history and `complete` text are normalized by the server already; live deltas pass only
+// its line-level warning filter. Render both through the same normalizer, so a reply looks the same
+// while streaming, after it finishes, and after a reopen. (This used to be a drifted copy that also
+// deleted fenced code and JSON examples.)
 function cleanMessageContent(content: string): string {
   if (!content) return content
-
-  // Strip ANSI codes first
-  content = stripAnsi(content)
-
-  // Detect raw gateway message payloads: [ { "id": "...", "content": "..." } ]
-  // Extract just the content fields
-  try {
-    const trimmed = content.trim()
-    if ((trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('{') && trimmed.endsWith('}'))) {
-      const parsed = JSON.parse(trimmed)
-      const items = Array.isArray(parsed) ? parsed : [parsed]
-      if (items.length > 0 && items[0].content && items[0].from) {
-        return items.map(m => m.content).filter(Boolean).join('\n\n')
-      }
-      if (items.length > 0 && items[0].payloads) {
-        return items[0].payloads.map((p: any) => p.text).filter(Boolean).join('\n\n')
-      }
-    }
-  } catch {}
-
-  // Process line by line — keep only human-readable content
-  const lines = content.split('\n')
-  const cleanedLines: string[] = []
-  let braceDepth = 0 // Track JSON nesting depth
-  let bracketDepth = 0
-  let skippingArtifactBlock = false
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    const trimmed = line.trim()
-
-    // Track JSON brace/bracket depth
-    if (braceDepth > 0 || bracketDepth > 0) {
-      for (const ch of trimmed) {
-        if (ch === '{') braceDepth++
-        else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1)
-        else if (ch === '[') bracketDepth++
-        else if (ch === ']') bracketDepth = Math.max(0, bracketDepth - 1)
-      }
-      continue // Skip everything inside JSON blocks
-    }
-
-    // Detect start of JSON block
-    if (trimmed === '{' || trimmed.startsWith('{') || trimmed.startsWith('[')) {
-      braceDepth += (trimmed.match(/\{/g) || []).length - (trimmed.match(/\}/g) || []).length
-      bracketDepth += (trimmed.match(/\[/g) || []).length - (trimmed.match(/\]/g) || []).length
-      if (braceDepth > 0 || bracketDepth > 0) continue
-      // Single-line JSON (opened and closed on same line)
-      continue
-    }
-
-    if (!trimmed) {
-      skippingArtifactBlock = false
-      cleanedLines.push(line)
-      continue
-    }
-
-    // Skip lines with ANSI escape codes
-    if (trimmed.match(/\[[\d;]*m/) || trimmed.match(/\x1b\[/)) continue
-
-    // Skip OpenClaw internal lines
-    if (isRuntimeStatusLine(trimmed) || trimmed.startsWith('🦞 OpenClaw') || trimmed.match(/^(Usage|Options|Commands|Examples|Docs|Available fields|Unknown JSON|GraphQL|\(Command exited|Command still|Process exited|Successfully wrote|store:)/)) continue
-
-    // Skip inline tool calls
-    if (trimmed.match(/\{"type"\s*:\s*"/)) continue
-
-    // Skip bare timestamps
-    if (trimmed.match(/^\d{1,2}:\d{2}:\d{2}\s*(AM|PM)?\s*$/)) continue
-
-    // Skip lines that are just closing braces
-    if (trimmed.match(/^[}\]],?\s*$/)) continue
-
-    if (isToolArtifactLine(trimmed)) {
-      skippingArtifactBlock = true
-      continue
-    }
-
-    if (skippingArtifactBlock) {
-      continue
-    }
-
-    cleanedLines.push(line)
-  }
-
-  const cleaned = cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
-  return cleaned || '(processing...)'
+  return normalizeChatMessage(content) || '(processing...)'
 }
 
 /**
@@ -231,6 +142,7 @@ export function splitTrailingSystemNotice(content: string): { text: string; noti
 }
 
 export default function AgentChatPanel({ agentId, agentName, agentStatus, agentGeneration, onClose, onSuccess, onNavigateToDoc }: Props) {
+  const panelPersistence = useAgentPanelPersistence(onClose)
   const { config } = useAuth()
   const { showSuccess, showError } = useToast()
   // Staged Template Agents can only chat when their server-owned dev runtime
@@ -239,9 +151,13 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
   const browserChatEnabled = hasChatExecutionAccess(config) || stagedTemplateAgent
   const [messages, setMessages] = useState<Message[]>([])
   const [loadingHistory, setLoadingHistory] = useState(true)
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  // Bumped by every local change a history response already in flight must not overwrite (clear,
+  // reset, restore); such a response describes the conversation as it was before that change.
+  const historyEpochRef = useRef(0)
   const [rawViewIds, setRawViewIds] = useState<Set<string>>(new Set())
   const [input, setInput] = useState('')
-  const [composerExpanded, setComposerExpanded] = useState(false)
+  const [composerExpanded, setComposerExpanded] = useState(readChatComposerExpanded)
   const [sending, setSending] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -258,11 +174,27 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
   const [gatewayAvailable, setGatewayAvailable] = useState<boolean | null>(null)
   const [chatEnabled, setChatEnabled] = useState(browserChatEnabled && !stagedTemplateAgent)
   const [resettingSession, setResettingSession] = useState(false)
+  const [changingConversation, setChangingConversation] = useState(false)
+  const conversationBusy = resettingSession || changingConversation
   const [forwardTargetMsgId, setForwardTargetMsgId] = useState<string | null>(null)
   const [forwardTargets, setForwardTargets] = useState<ForwardTargetsState>({ status: 'idle', targets: [] })
   const [forwardingTo, setForwardingTo] = useState<string | null>(null)
   const [forwardError, setForwardError] = useState<string | null>(null)
   const [forwardMenuAlign, setForwardMenuAlign] = useState<'left' | 'right'>('right')
+  // Only the open picker's elements carry these refs; one picker is open at a time.
+  const forwardRootRef = useRef<HTMLDivElement | null>(null)
+  const forwardTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const forwardMenuRef = useRef<HTMLDivElement | null>(null)
+  const forwardOpenedByKeyboardRef = useRef(false)
+  const closeForwardPicker = useCallback(() => setForwardTargetMsgId(null), [])
+  const forwardPopover = useDismissiblePopover({
+    open: forwardTargetMsgId !== null,
+    onClose: closeForwardPicker,
+    rootRef: forwardRootRef,
+    triggerRef: forwardTriggerRef,
+    // Stay open while a forward is sending, so a failure is reported where it was started.
+    holdOpen: forwardingTo !== null,
+  })
   const [isSlideMode, setIsSlideMode] = useState(() => {
     // Load saved preference from localStorage
     const saved = localStorage.getItem(`agent-chat-mode-${agentId}`)
@@ -271,9 +203,12 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
   const [isListening, setIsListening] = useState(false)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const [showArchives, setShowArchives] = useState(false)
-  const [archives, setArchives] = useState<Array<{ filename: string; timestamp: number; messageCount: number; title: string; active?: boolean }>>([])
-  const [viewingArchive, setViewingArchive] = useState<{ filename: string; messages: any[]; active?: boolean } | null>(null)
+  // `conversation`: a chat ended by Clear that keeps its runtime context; Continue resumes it and Delete only
+  // removes it from History. `archive-file`: a legacy archive, the chat's only copy.
+  const [archives, setArchives] = useState<Array<{ filename: string; timestamp: number; messageCount: number; title: string; active?: boolean; kind?: 'current' | 'conversation' | 'archive-file'; resumable?: boolean }>>([])
+  const [viewingArchive, setViewingArchive] = useState<{ filename: string; messages: any[]; active?: boolean; resumable?: boolean } | null>(null)
   const [copyFeedback, setCopyFeedback] = useState(false)
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
   const [inputHistory, setInputHistory] = useState<string[]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
@@ -327,39 +262,49 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
   const timelineRows = buildAgentChatTimelineRows(messages)
   const timelineMessageMap = new Map(messages.map((message) => [message.id, message]))
 
-  // Poll for new messages (agent-initiated updates)
+  // Keep the panel in step with the persisted transcript: history on open, replies that finished
+  // while another tab or a reload was watching, agent-initiated messages. Paused while this tab is
+  // sending -- its stream owns those bubbles until it settles -- and re-run as soon as it has. A turn
+  // adopted after a reload has no local bubbles, so polling continues and shows it when persisted.
   useEffect(() => {
+    // Set by cleanup, which runs whenever a send starts or ends: a response requested before that
+    // describes the conversation as it was and must not overwrite the bubbles the send created.
+    let superseded = false
+    let polling = false
     const pollMessages = async () => {
-      // Don't poll while actively streaming
-      if (streaming) return
+      if (sending || polling) return
+      polling = true
+      const epoch = historyEpochRef.current
+      const isCurrent = () => !superseded && epoch === historyEpochRef.current
       try {
         const r = await fetch(`/api/agents/${agentId}/chat/messages`, { headers: generationHeaders })
+        if (!isCurrent()) return
         if (r.status === 404 || r.status === 410) {
           setMessages([])
           onClose()
           return
         }
-        const data = await r.json()
-        const serverMessages: Message[] = (data.messages || []).map((m: any, i: number) => ({
-          role: m.role,
-          content: m.content,
-          timestamp: m.timestamp || Date.now(),
-          id: m.id || `poll-${i}`
-        }))
-        // Only update if server has more messages than local (agent posted something new)
-        if (serverMessages.length > messages.length) {
-          setMessages(serverMessages)
-        }
-        setLoadingHistory(false)
-      } catch {
-        setLoadingHistory(false)
+        const data = await r.json().catch(() => null)
+        if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`)
+        const serverMessages = parseAgentChatHistory(data)
+        if (!isCurrent()) return
+        setMessages(current => reconcileAgentChatHistory(current, serverMessages))
+        setHistoryError(null)
+      } catch (err) {
+        if (isCurrent()) setHistoryError(err instanceof Error ? err.message : String(err))
+      } finally {
+        polling = false
+        if (isCurrent()) setLoadingHistory(false)
       }
     }
 
-    pollMessages() // Fetch immediately on mount
+    pollMessages() // Fetch immediately on mount, and again the moment a send settles
     const interval = setInterval(pollMessages, 3000)
-    return () => clearInterval(interval)
-  }, [agentId, agentGeneration, messages.length, onClose, streaming])
+    return () => {
+      superseded = true
+      clearInterval(interval)
+    }
+  }, [agentId, agentGeneration, onClose, sending])
 
   // Poll the server's view of what's actually running. This is the only way a turn already in
   // flight ever becomes visible in this tab: `streaming` is local state that a page refresh
@@ -482,7 +427,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
   useEffect(() => {
     checkGateway()
     checkChatExecutionReadiness()
-    fetchArchivesList() // Fetch archives on mount to enable/disable history button
+    fetchArchives() // Fetch archives on mount to enable/disable history button
     // Delay focus slightly to ensure component is fully mounted
     setTimeout(() => inputRef.current?.focus(), 100)
 
@@ -576,6 +521,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
       remarkPlugins={[remarkGfm]}
       urlTransform={transformWorkspaceMarkdownUrl}
       components={{
+        table: ScrollableMarkdownTable,
         a: ({ href, children }) => {
           if (href?.startsWith('workspace-file:') && onNavigateToDoc) {
             const file = href.replace('workspace-file:', '')
@@ -598,14 +544,13 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
           }
           return <a href={href} target="_blank" rel="noreferrer" className={getAgentChatLinkClassName(role)}>{children}</a>
         },
-        code: ({ children, className }) => (
-          <code className={className?.includes('language-') ? className : getAgentChatInlineCodeClassName(role)}>
+        // A block without a language has no class either; it is still a block, not inline code.
+        code: ({ node, children, className }) => (
+          <code className={className?.includes('language-') || isCodeBlockNode(node) ? className : getAgentChatInlineCodeClassName(role)}>
             {children}
           </code>
         ),
-        pre: ({ children }) => (
-          <pre className={getAgentChatCodeBlockClassName(role)}>{children}</pre>
-        ),
+        pre: role === 'user' ? UserCodeBlock : AssistantCodeBlock,
       }}
     >
       {linkifyWorkspaceFiles(clean ? cleanMessageContent(content) : content)}
@@ -677,18 +622,29 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
     }
   }
 
+  // Show a conversation that replaces the current one (cleared, reset, or resumed). Polls already in
+  // flight describe the old one; the server now runs this one, so drop any seed this tab adopted.
+  function showConversation(next: Message[]) {
+    historyEpochRef.current += 1
+    setMessages(next)
+    setHistoryError(null)
+    setLoadingHistory(false)
+    setSessionId(buildPersistentDashboardChatSessionId(agentId))
+  }
+
   async function resetAgentSession() {
+    if (sending || streaming || conversationBusy) return
     try {
       setResettingSession(true)
       setError(null)
       const resp = await fetch(`/api/agents/${agentId}/reset-session`, { method: 'POST', headers: generationHeaders })
       const data = await resp.json().catch(() => ({}))
       if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`)
-      setMessages([])
+      showConversation([])
       setInputHistory([])
       setHistoryIndex(-1)
-      setSessionId(buildPersistentDashboardChatSessionId(agentId))
       setShowClearConfirm(false)
+      fetchArchives()
       setFollowing(true)
     } catch (err: any) {
       setError(err?.message || 'Failed to reset agent session')
@@ -727,7 +683,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
     // turns poll (this tab reloaded, or another tab started it) has no local fetch of its own.
     // The Send button is hidden in that state for the same reason; guard the keyboard/resend paths
     // that don't go through the button.
-    if ((!textToSend && queuedAttachments.length === 0) || sending || streaming) return
+    if ((!textToSend && queuedAttachments.length === 0) || sending || streaming || conversationBusy) return
     if (!chatEnabled) {
       setError('Agent chat is disabled because no AI execution path is configured. Open BYOK or Keys & Secrets first.')
       return
@@ -758,18 +714,22 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
       const displayMessage = buildAgentInboxDisplayMessage(textToSend, uploadedAttachments)
       const executionMessage = appendAgentInboxAttachmentContext(textToSend, uploadedAttachments)
 
+      // Pending until the persisted transcript returns them; see reconcileAgentChatHistory.
       const userMsg: Message = {
         role: 'user',
         content: displayMessage,
         timestamp: Date.now(),
-        id: `user-${Date.now()}`
+        id: `user-${Date.now()}`,
+        pending: true,
+        ...(executionMessage !== displayMessage ? { sentContent: executionMessage } : {}),
       }
       assistantId = `assistant-${Date.now()}`
       const assistantMsg: Message = {
         role: 'assistant',
         content: '',
         timestamp: Date.now(),
-        id: assistantId
+        id: assistantId,
+        pending: true,
       }
       // Sending is a request to see the reply, wherever the reader had scrolled to.
       setFollowing(true)
@@ -850,7 +810,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
               setError(friendly)
               setMessages(prev => prev.map(m =>
                 m.id === assistantId
-                  ? { ...m, content: friendly }
+                  ? { ...m, content: friendly, failed: true }
                   : m
               ))
               setStreaming(false)
@@ -886,7 +846,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
       if (assistantId) {
         setMessages(prev => prev.map(m =>
           m.id === assistantId
-            ? { ...m, content: friendly }
+            ? { ...m, content: friendly, failed: true }
             : m
         ))
       }
@@ -968,12 +928,38 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
 
   // Opens toward the side with room: a short reply's Forward button sits near the panel's left edge,
   // where a menu opening leftwards was cut off by the scrolling message list.
-  function openForwardPicker(messageId: string, anchor: HTMLElement) {
+  function openForwardPicker(messageId: string, anchor: HTMLElement, byKeyboard: boolean) {
+    forwardOpenedByKeyboardRef.current = byKeyboard
     const viewport = anchor.closest('.overflow-y-auto')?.getBoundingClientRect()
     setForwardMenuAlign(viewport && anchor.getBoundingClientRect().right - FORWARD_MENU_WIDTH_PX < viewport.left + 8 ? 'left' : 'right')
     setForwardTargetMsgId(messageId)
     setForwardError(null)
     void refreshForwardTargets()
+  }
+
+  const forwardMenuItems = () => Array.from(forwardMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') || [])
+
+  // Opened from the keyboard, focus the first target once one is listed (targets load on open).
+  useEffect(() => {
+    if (!forwardTargetMsgId || !forwardOpenedByKeyboardRef.current) return
+    const [first] = forwardMenuItems()
+    if (!first) return
+    first.focus()
+    forwardOpenedByKeyboardRef.current = false
+  }, [forwardTargetMsgId, forwardTargets.targets.length])
+
+  // Menu-button keyboard pattern: arrows move between targets (wrapping), Home and End jump.
+  function handleForwardKeyDown(event: KeyboardEvent) {
+    if (!forwardTargetMsgId || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+    const items = forwardMenuItems()
+    if (items.length === 0) return
+    event.preventDefault()
+    const current = items.indexOf(document.activeElement as HTMLButtonElement)
+    const next = event.key === 'Home' ? 0
+      : event.key === 'End' ? items.length - 1
+        : event.key === 'ArrowDown' ? (current + 1) % items.length
+          : current <= 0 ? items.length - 1 : current - 1
+    items[next].focus()
   }
 
   async function forwardToGroup(target: ForwardTarget) {
@@ -997,39 +983,37 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
   }
 
   async function clearMessages() {
+    if (sending || streaming || conversationBusy) return
+    setChangingConversation(true)
+    setError(null)
     try {
       const r = await fetch(`/api/agents/${agentId}/chat/messages`, { method: 'DELETE', headers: generationHeaders })
-      const data = await r.json()
-      if (data.ok) {
-        setMessages([])
-        setShowClearConfirm(false)
-        setInputHistory([]) // Clear input history when chat is archived
-        setHistoryIndex(-1)
-        fetchArchives()
-        setFollowing(true)
-      }
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || !data.ok) throw new Error(data?.error || `HTTP ${r.status}`)
+      showConversation([])
+      setShowClearConfirm(false)
+      setInputHistory([]) // Clear input history when chat is archived
+      setHistoryIndex(-1)
+      fetchArchives()
+      setFollowing(true)
     } catch (e) {
-      setError(String(e))
+      // Say so instead of leaving the dialog open with nothing happening.
+      setShowClearConfirm(false)
+      setError(`Could not clear the chat: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setChangingConversation(false)
     }
   }
 
   async function fetchArchives() {
+    const epoch = historyEpochRef.current
     try {
       const r = await fetch(`/api/agents/${agentId}/chat/archives`, { headers: generationHeaders })
       const data = await r.json()
-      setArchives(data.archives || [])
-    } catch (e) {
-      console.error('Failed to fetch archives:', e)
-    }
-  }
-
-  async function fetchArchivesList() {
-    try {
-      const r = await fetch(`/api/agents/${agentId}/chat/archives`, { headers: generationHeaders })
-      const data = await r.json()
-      setArchives(data.archives || [])
-    } catch (err) {
-      console.error('Failed to fetch archives list:', err)
+      if (!r.ok || !Array.isArray(data.archives)) throw new Error(data?.error || 'History could not be loaded')
+      if (epoch === historyEpochRef.current) setArchives(data.archives)
+    } catch (error) {
+      if (epoch === historyEpochRef.current) setError(error instanceof Error ? error.message : 'History could not be loaded')
     }
   }
 
@@ -1037,20 +1021,26 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
     try {
       const r = await fetch(`/api/agents/${agentId}/chat/archives/${filename}`, { headers: generationHeaders })
       const data = await r.json()
+      if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`)
       const archiveMeta = archives.find((archive) => archive.filename === filename)
-      setViewingArchive({ filename, messages: data.messages || [], active: archiveMeta?.active })
+      setViewingArchive({ filename, messages: parseAgentChatHistory(data), active: archiveMeta?.active, resumable: archiveMeta?.resumable })
       setShowArchives(false)
     } catch (e) {
-      console.error('Failed to load archive:', e)
+      const message = `Could not load the chat from History: ${e instanceof Error ? e.message : String(e)}`
+      setError(message)
+      showError(message)
     }
   }
 
   async function restoreArchive(filename: string) {
+    if (sending || streaming || conversationBusy) return
+    setChangingConversation(true)
+    setError(null)
     try {
       const r = await fetch(`/api/agents/${agentId}/chat/archives/${filename}/restore`, { method: 'POST', headers: generationHeaders })
       const data = await r.json()
       if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`)
-      setMessages(data.messages || [])
+      showConversation(parseAgentChatHistory({ messages: data.messages || [] }))
       setViewingArchive(null)
       setShowArchives(false)
       setError(null)
@@ -1059,19 +1049,27 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
       setTimeout(() => inputRef.current?.focus(), 0)
     } catch (e: any) {
       setError(e?.message || 'Failed to restore archived chat')
+      showError(e?.message || 'Could not continue the conversation')
+    } finally {
+      setChangingConversation(false)
     }
   }
 
   async function deleteArchive(filename: string) {
     try {
-      await fetch(`/api/agents/${agentId}/chat/archives/${filename}`, { method: 'DELETE', headers: generationHeaders })
+      const r = await fetch(`/api/agents/${agentId}/chat/archives/${filename}`, { method: 'DELETE', headers: generationHeaders })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`)
       setArchives(archives.filter(a => a.filename !== filename))
       setDeleteConfirm(null)
       if (viewingArchive?.filename === filename) {
         setViewingArchive(null)
       }
     } catch (e) {
-      console.error('Failed to delete archive:', e)
+      setDeleteConfirm(null)
+      const message = `Could not remove the chat from History: ${e instanceof Error ? e.message : String(e)}`
+      setError(message)
+      showError(message)
     }
   }
 
@@ -1082,6 +1080,17 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
     navigator.clipboard.writeText(text)
     setCopyFeedback(true)
     setTimeout(() => setCopyFeedback(false), 2000)
+  }
+
+  async function copyMessage(message: Message) {
+    try {
+      // What the bubble shows: the reply as rendered from, never the raw runtime transcript.
+      await copyText(message.role === 'assistant' ? cleanMessageContent(message.content) : message.content)
+      setCopiedMessageId(message.id)
+      setTimeout(() => setCopiedMessageId(current => (current === message.id ? null : current)), 2000)
+    } catch {
+      showError('Could not copy the message. Your browser blocked clipboard access.')
+    }
   }
 
   function downloadConversation() {
@@ -1123,7 +1132,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
 
   if (gatewayAvailable === false) {
     return (
-      <div className={`fixed inset-0 z-50 ${isSlideMode ? '' : 'flex items-center justify-center bg-black/40'}`}>
+      <div ref={panelPersistence.panelRef} tabIndex={-1} className={`fixed inset-0 z-50 ${isSlideMode ? '' : 'flex items-center justify-center bg-black/40'}`} onClick={panelPersistence.onBackdropClick} onKeyDown={panelPersistence.onEscape}>
         <div className={`bg-white dark:bg-gray-800 shadow-2xl ${isSlideMode ? 'h-full w-full sm:w-[600px] absolute right-0 top-0' : 'rounded-xl w-full sm:w-[600px] mx-2 sm:mx-0'} p-4 sm:p-6`}>
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-semibold text-gray-800 dark:text-gray-200">Agent Chat: {agentName}</h2>
@@ -1135,7 +1144,8 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
               >
                 {isSlideMode ? '◧' : '»'}
               </button>
-              <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl p-2 min-w-[40px] min-h-[40px] flex items-center justify-center">×</button>
+              <KeepAgentPanelOpenButton keepOpen={panelPersistence.keepOpen} onToggle={panelPersistence.toggleKeepOpen} />
+              <button onClick={onClose} aria-label="Close chat" className="text-gray-400 hover:text-gray-600 text-xl p-2 min-w-[40px] min-h-[40px] flex items-center justify-center">×</button>
             </div>
           </div>
           <div className="text-center py-8">
@@ -1174,16 +1184,33 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
   }
 
   const downloadState = getAgentChatDownloadState(messages, loadingHistory, streaming)
+  const removesFromHistoryOnly = archives.find((archive) => archive.filename === deleteConfirm)?.kind === 'conversation'
+
+  function handlePanelEscape(event: React.KeyboardEvent<HTMLElement>) {
+    if (event.key !== 'Escape' || event.defaultPrevented) return
+    // Dismiss the innermost surface before closing the conversation beneath it.
+    const dismissChild = forwardTargetMsgId !== null ? () => {
+      forwardTriggerRef.current?.focus()
+      setForwardTargetMsgId(null)
+    }
+      : deleteConfirm !== null ? () => setDeleteConfirm(null)
+        : showClearConfirm ? () => setShowClearConfirm(false)
+          : viewingArchive !== null ? () => setViewingArchive(null)
+            : showArchives ? () => setShowArchives(false) : null
+    if (dismissChild) {
+      event.preventDefault()
+      event.stopPropagation()
+      dismissChild()
+    } else panelPersistence.onEscape(event)
+  }
 
   return (
     <div
+      ref={panelPersistence.panelRef}
+      tabIndex={-1}
       className={`fixed inset-0 z-50 ${isSlideMode ? '' : 'flex items-center justify-center bg-black/40'}`}
-      onClick={(e) => {
-        // Close when clicking outside panel (backdrop)
-        if (e.target === e.currentTarget) {
-          onClose()
-        }
-      }}
+      onClick={panelPersistence.onBackdropClick}
+      onKeyDown={handlePanelEscape}
     >
       <div
         className={`bg-white dark:bg-gray-800 shadow-2xl ${isSlideMode ? 'h-full absolute right-0 top-0' : 'rounded-xl h-[90vh] sm:h-[600px]'} w-full sm:w-[700px] flex flex-col`}
@@ -1207,25 +1234,27 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
               <ProductIconCell iconName="download" label={downloadState.title} size="sm" className="border-transparent bg-transparent text-current" />
               <span>Download</span>
             </button>
+            <KeepAgentPanelOpenButton keepOpen={panelPersistence.keepOpen} onToggle={panelPersistence.toggleKeepOpen} />
             <button
               onClick={onClose}
+              aria-label="Close chat"
               className="shrink-0 text-gray-400 hover:text-gray-600 transition-colors"
             >
               <ProductIconCell iconName="close" label="Close" size="sm" className="border-transparent bg-transparent text-current" />
             </button>
           </div>
           <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
-            <p className="min-w-0 text-xs text-gray-400">Real-time streaming from the active runtime</p>
+            <p className="min-w-0 text-xs text-gray-400">Responses from the active runtime</p>
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5 sm:gap-2">
               <button
                 onClick={resetAgentSession}
-                disabled={resettingSession}
+                disabled={conversationBusy || sending || streaming}
                 className={`text-xs px-2 py-1 rounded transition-colors shrink-0 ${
-                  resettingSession
-                    ? 'text-gray-300 cursor-not-allowed'
-                    : 'text-gray-600 hover:bg-gray-100'
+                  conversationBusy || sending || streaming
+                    ? 'text-gray-300 cursor-not-allowed dark:text-gray-500'
+                    : 'text-gray-600 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-700'
                 }`}
-                title="Reset the agent runtime session for a completely fresh chat"
+                title="Start a new conversation with a fresh runtime session. This chat moves to History."
               >
                 <span className="inline-flex items-center gap-1.5 sm:gap-2">
                   <ProductIconCell iconName="restart" label="Reset Session" size="sm" className="border-transparent bg-transparent text-current" />
@@ -1237,8 +1266,8 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
                 disabled={archives.length === 0}
                 className={`text-xs px-2 py-1 rounded transition-colors shrink-0 ${
                   archives.length === 0
-                    ? 'text-gray-300 cursor-not-allowed'
-                    : 'text-gray-600 hover:bg-gray-100'
+                    ? 'text-gray-300 cursor-not-allowed dark:text-gray-500'
+                    : 'text-gray-600 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-700'
                 }`}
                 title={archives.length === 0 ? 'No chat history yet' : 'View chat history'}
               >
@@ -1249,8 +1278,11 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
               </button>
               <button
                 onClick={() => setShowClearConfirm(true)}
-                className="text-xs px-2 py-1 text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:hover:bg-gray-700 shrink-0"
-                title="Clear messages"
+                // A turn still running writes into the conversation it started in; ending that
+                // conversation under it would leave its reply where neither the chat nor History shows it.
+                disabled={sending || streaming || conversationBusy}
+                className="text-xs px-2 py-1 text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 shrink-0 disabled:text-gray-300 dark:disabled:text-gray-500 disabled:cursor-not-allowed"
+                title={sending || streaming ? 'Wait for the reply to finish, or stop it, to clear the chat' : 'Clear messages'}
               >
                 <span className="inline-flex items-center gap-1.5 sm:gap-2">
                   <ProductIconCell iconName="delete" label="Clear" size="sm" className="border-transparent bg-transparent text-current" />
@@ -1307,7 +1339,15 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
             </div>
           )}
 
-          {!loadingHistory && messages.length === 0 && (
+          {/* A failed load is not an empty conversation: say so instead of inviting a fresh start. */}
+          {historyError && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-100" role="alert">
+              <div className="font-medium">Chat history could not be loaded</div>
+              <div className="mt-1 break-words text-xs opacity-90">{stripAnsi(historyError)} Retrying automatically.</div>
+            </div>
+          )}
+
+          {!loadingHistory && !historyError && messages.length === 0 && (
             <div className="text-center py-12 text-gray-400 text-sm">
               <div className="text-4xl mb-3">💬</div>
               <p>Start a conversation with {agentName}</p>
@@ -1329,7 +1369,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
 
             const msg = timelineMessageMap.get(row.key)
             if (!msg) return null
-            const msgIsError = msg.role === 'assistant' && isErrorContent(msg.content)
+            const msgIsError = msg.role === 'assistant' && (msg.failed === true || isRuntimeDiagnosticText(msg.content))
             const isStreamingPlaceholder = streaming && msg.role === 'assistant' && msg.id === messages[messages.length - 1]?.id
             return (
             <div
@@ -1337,7 +1377,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
               className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
             >
               <div
-                className={`max-w-[80%] rounded-lg px-4 py-2 relative group ${
+                className={`min-w-0 max-w-[80%] rounded-lg px-4 py-2 relative group ${
                   msgIsError
                     ? 'bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
                     : msg.role === 'user'
@@ -1352,7 +1392,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
                     {rawViewIds.has(msg.id) ? (
                       <pre className="text-xs whitespace-pre-wrap break-words font-mono overflow-auto max-h-60">{cleanMessageContent(msg.content)}</pre>
                     ) : (
-                      <div className="text-sm prose prose-sm dark:prose-invert max-w-none break-words [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+                      <div className="min-w-0 text-sm prose prose-sm dark:prose-invert max-w-none break-words [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
                         {renderMarkdown(bubbleText || (isStreamingPlaceholder ? '▌' : ''), true, 'assistant')}
                       </div>
                     )}
@@ -1394,7 +1434,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
                   </>
                 ) : (
                   <>
-                    <div className="text-sm prose prose-sm prose-invert agent-chat-user-markdown max-w-none break-words [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+                    <div className="min-w-0 text-sm prose prose-sm prose-invert agent-chat-user-markdown max-w-none break-words [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
                       {renderMarkdown(msg.content || '', false, 'user')}
                     </div>
                     {onNavigateToDoc && getResolvedFileMentions(msg.content || '').length > 0 && (
@@ -1421,29 +1461,47 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
                 )}
 
                 {/* Action buttons on hover */}
-                <div className="absolute -bottom-2 right-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                <div className={`absolute -bottom-2 right-0 flex items-center gap-1 ${forwardTargetMsgId === msg.id ? 'opacity-100' : 'opacity-0'} group-hover:opacity-100 focus-within:opacity-100 transition-opacity`}>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); void copyMessage(msg) }}
+                    className="bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 rounded-full p-1.5 shadow-md hover:bg-gray-50 dark:hover:bg-gray-700"
+                    title={copiedMessageId === msg.id ? 'Copied' : 'Copy message'}
+                    aria-label={copiedMessageId === msg.id ? 'Message copied' : 'Copy message'}
+                  >
+                    <CopyIcon state={copiedMessageId === msg.id ? 'copied' : 'idle'} className="w-3 h-3" />
+                  </button>
                   {/* Forward to group */}
                   <div
+                    ref={forwardTargetMsgId === msg.id ? forwardRootRef : undefined}
                     className="relative"
-                    onKeyDown={(e) => {
-                      if (e.key === 'Escape' && forwardTargetMsgId === msg.id) {
-                        e.stopPropagation()
-                        setForwardTargetMsgId(null)
-                      }
-                    }}
+                    onKeyDown={handleForwardKeyDown}
+                    {...(forwardTargetMsgId === msg.id ? forwardPopover : {})}
                   >
                     <button
-                      onClick={(e) => { e.stopPropagation(); forwardTargetMsgId === msg.id ? setForwardTargetMsgId(null) : openForwardPicker(msg.id, e.currentTarget) }}
+                      ref={forwardTargetMsgId === msg.id ? forwardTriggerRef : undefined}
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); forwardTargetMsgId === msg.id ? setForwardTargetMsgId(null) : openForwardPicker(msg.id, e.currentTarget, e.detail === 0) }}
                       className="bg-white dark:bg-gray-800 text-purple-600 dark:text-purple-400 rounded-full p-1.5 shadow-md hover:bg-purple-50 dark:hover:bg-purple-900/30"
                       title="Forward to group"
+                      aria-label="Forward message"
+                      aria-haspopup="menu"
+                      aria-expanded={forwardTargetMsgId === msg.id}
+                      aria-controls={forwardTargetMsgId === msg.id ? `forward-menu-${msg.id}` : undefined}
                     >
-                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
                       </svg>
                     </button>
                     {forwardTargetMsgId === msg.id && (
-                      <div className={`absolute bottom-full ${forwardMenuAlign === 'left' ? 'left-0' : 'right-0'} mb-1 w-48 max-h-40 overflow-auto bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50`}>
-                        <div className="px-3 py-1.5 text-[10px] font-semibold text-gray-400 uppercase">Forward to</div>
+                      <div
+                        ref={forwardMenuRef}
+                        id={`forward-menu-${msg.id}`}
+                        role="menu"
+                        aria-label="Forward to"
+                        className={`absolute bottom-full ${forwardMenuAlign === 'left' ? 'left-0' : 'right-0'} mb-1 w-48 max-h-40 overflow-auto bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50`}
+                      >
+                        <div className="px-3 py-1.5 text-[10px] font-semibold text-gray-400 uppercase" aria-hidden="true">Forward to</div>
                         {forwardTargets.targets.length === 0 && forwardTargets.status === 'loading' && (
                           <div className="px-3 py-2 text-xs text-gray-400" role="status">Loading...</div>
                         )}
@@ -1462,11 +1520,13 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
                         {forwardTargets.targets.map(g => (
                           <button
                             key={`${g.type}:${g.name}`}
+                            type="button"
+                            role="menuitem"
                             onClick={() => forwardToGroup(g)}
                             disabled={forwardingTo === `${g.type}:${g.name}`}
-                            className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                            className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-50 focus:bg-gray-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500 dark:hover:bg-gray-700 dark:focus:bg-gray-700 transition-colors flex items-center gap-1.5 disabled:opacity-50"
                           >
-                            <span className="text-gray-400">{g.type === 'community' ? '🏘' : '👥'}</span>
+                            <span className="text-gray-400" aria-hidden="true">{g.type === 'community' ? '🏘' : '👥'}</span>
                             <span className="truncate text-gray-700 dark:text-gray-200">{channelLabel(g)}</span>
                             {forwardingTo === `${g.type}:${g.name}` && <span className="text-[10px] text-gray-400">sending...</span>}
                           </button>
@@ -1478,7 +1538,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
                   {msg.role === 'user' && (
                     <button
                       onClick={() => resendMessage(msg.id)}
-                      disabled={sending || streaming}
+                      disabled={sending || streaming || conversationBusy}
                       className="bg-white dark:bg-gray-800 text-sky-600 rounded-full p-1.5 shadow-md hover:bg-sky-50 disabled:opacity-40 disabled:cursor-not-allowed"
                       title="Resend this message"
                     >
@@ -1512,6 +1572,8 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
             </div>
           )}
         </div>
+
+        <span className="sr-only" aria-live="polite">{copiedMessageId ? 'Message copied' : ''}</span>
 
         {/* Error */}
         {error && (
@@ -1582,7 +1644,7 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
             />
             <button
               onClick={toggleVoiceInput}
-              disabled={sending || streaming || !gatewayAvailable || !chatEnabled}
+              disabled={sending || streaming || !gatewayAvailable || conversationBusy || !chatEnabled}
               className={`p-2 rounded-lg transition-colors text-sm font-medium shrink-0 ${
                 isListening
                   ? 'bg-red-500 text-white hover:bg-red-600 animate-pulse'
@@ -1611,6 +1673,8 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
                   e.preventDefault()
                   sendMessage()
                 } else if (e.key === 'Escape') {
+                  e.preventDefault()
+                  e.stopPropagation()
                   if (streaming) {
                     cancelStreaming()
                   } else {
@@ -1642,18 +1706,18 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
               placeholder={isListening ? "Listening…" : "Message…"}
               aria-label="Message agent"
               title="Type, speak, or drop files. Enter to send; Option+Enter or Shift+Enter for a new line."
-              disabled={sending || streaming || !gatewayAvailable || isListening || !chatEnabled}
+              disabled={sending || streaming || !gatewayAvailable || isListening || conversationBusy || !chatEnabled}
               className="block w-full min-h-10 max-h-40 resize-y px-4 pr-10 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent text-sm disabled:bg-gray-50 disabled:cursor-not-allowed dark:border-gray-700 dark:bg-gray-900"
             />
             <button
               type="button"
-              onClick={() => { if (inputRef.current) inputRef.current.style.height = ''; setComposerExpanded(value => !value) }}
+              onClick={() => { if (inputRef.current) inputRef.current.style.height = ''; const next = !composerExpanded; saveChatComposerExpanded(next); setComposerExpanded(next) }}
               className="absolute right-2 top-1.5 rounded p-1 text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700"
               aria-label={composerExpanded ? 'Collapse message box' : 'Expand message box'}
               title={composerExpanded ? 'Collapse message box' : 'Expand message box'}
               aria-expanded={composerExpanded}
             >
-              <svg className={`h-4 w-4 transition-transform ${composerExpanded ? 'rotate-180' : ''}`} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m5 7 5 5 5-5" /></svg>
+              <svg className={`h-4 w-4 transition-transform ${composerExpanded ? '' : 'rotate-180'}`} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m5 7 5 5 5-5" /></svg>
             </button>
             </div>
             {streaming ? (
@@ -1668,8 +1732,8 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
               <button
                 ref={sendButtonRef}
                 onClick={() => sendMessage()}
-                disabled={(!input.trim() && attachments.length === 0) || sending || !gatewayAvailable || !chatEnabled}
-                className="px-4 py-2 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-colors text-sm font-medium disabled:bg-gray-300 dark:disabled:bg-gray-700 disabled:cursor-not-allowed"
+                disabled={(!input.trim() && attachments.length === 0) || sending || conversationBusy || !gatewayAvailable || !chatEnabled}
+                className="px-4 py-2 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-colors text-sm font-medium disabled:bg-gray-200 disabled:text-gray-600 dark:disabled:bg-gray-700 dark:disabled:text-gray-300 disabled:cursor-not-allowed"
               >
                 Send
               </button>
@@ -1681,19 +1745,20 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
         {showClearConfirm && (
           <div className="absolute inset-0 bg-black/20 flex items-center justify-center z-10">
             <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl p-6 max-w-sm mx-4">
-              <h3 className="text-base font-semibold mb-2">Clear Chat?</h3>
-              <p className="text-sm text-gray-600 mb-4">
-                This will archive all current messages and start a fresh chat. You can view archived chats anytime from History.
+              <h3 className="text-base font-semibold mb-2 dark:text-gray-100">Clear Chat?</h3>
+              <p className="text-sm text-gray-600 mb-4 dark:text-gray-300">
+                This chat moves to History and a new conversation starts. Choose Continue in History to resume this conversation's context.
               </p>
               <div className="flex gap-2 justify-end">
                 <button
                   onClick={() => setShowClearConfirm(false)}
-                  className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:hover:bg-gray-700"
+                  className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={clearMessages}
+                  disabled={sending || streaming || conversationBusy}
                   className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-700 transition-colors"
                 >
                   Clear & Archive
@@ -1759,48 +1824,50 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
         {viewingArchive && (
           <div className="absolute inset-0 bg-black/20 flex items-center justify-center z-20">
             <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl p-6 max-w-2xl mx-4 max-h-[80vh] flex flex-col w-full">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-base font-semibold">Archived Chat</h3>
-                <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-start justify-between gap-2 mb-4">
+                <h3 className="text-base font-semibold dark:text-gray-100">Archived Chat</h3>
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     onClick={() => copyToClipboard(viewingArchive.messages)}
-                    className="text-xs px-2 py-1 text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:hover:bg-gray-700"
+                    className="text-xs px-2 py-1 text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
                     title="Copy to clipboard"
                   >
                     📋 Copy
                   </button>
                   <button
                     onClick={() => downloadArchive(viewingArchive.messages, viewingArchive.filename)}
-                    className="text-xs px-2 py-1 text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:hover:bg-gray-700"
+                    className="text-xs px-2 py-1 text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
                     title="Download as text file"
                   >
                     💾 Download
                   </button>
-                  {!viewingArchive.active && (
+                  {!viewingArchive.active && viewingArchive.resumable !== false && (
                     <button
                       onClick={() => restoreArchive(viewingArchive.filename)}
-                      className="text-xs px-2 py-1 text-sky-600 hover:bg-sky-50 rounded transition-colors"
-                      title="Continue this conversation"
+                      disabled={sending || streaming || conversationBusy}
+                      className="text-xs px-2 py-1 text-sky-600 hover:bg-sky-50 rounded transition-colors dark:text-sky-300 dark:hover:bg-sky-900/40 disabled:opacity-40 disabled:cursor-not-allowed"
+                      title={sending || streaming ? 'Wait for the reply to finish to continue another conversation' : 'Continue this conversation'}
                     >
                       ↺ Continue
                     </button>
                   )}
                   <button
                     onClick={() => setDeleteConfirm(viewingArchive.filename)}
-                    className="text-xs px-2 py-1 text-red-600 hover:bg-red-50 rounded transition-colors"
+                    className="text-xs px-2 py-1 text-red-600 hover:bg-red-50 rounded transition-colors dark:text-red-300 dark:hover:bg-red-900/30"
                     title="Delete archive"
                   >
                     🗑 Delete
                   </button>
                   <button
                     onClick={() => setViewingArchive(null)}
+                    aria-label="Close archived chat"
                     className="text-gray-400 hover:text-gray-600 text-lg leading-none"
                   >
                     ×
                   </button>
                 </div>
               </div>
-              <div className="overflow-y-auto flex-1 space-y-3 border border-gray-200 rounded p-4 dark:border-gray-700">
+              <div className="min-h-0 overflow-y-auto flex-1 space-y-3 border border-gray-200 rounded p-4 dark:border-gray-700">
                 {viewingArchive.messages.length === 0 ? (
                   <div className="flex items-center justify-center h-full text-gray-400 text-sm">
                     No messages in this archive
@@ -1861,14 +1928,16 @@ export default function AgentChatPanel({ agentId, agentName, agentStatus, agentG
         {deleteConfirm && (
           <div className="absolute inset-0 bg-black/20 flex items-center justify-center z-30">
             <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl p-6 max-w-sm mx-4">
-              <h3 className="text-base font-semibold mb-2">Delete Archive?</h3>
-              <p className="text-sm text-gray-600 mb-4">
-                This archive will be permanently deleted. This action cannot be undone.
+              <h3 className="text-base font-semibold mb-2 dark:text-gray-100">{removesFromHistoryOnly ? 'Remove from History?' : 'Delete Archive?'}</h3>
+              <p className="text-sm text-gray-600 mb-4 dark:text-gray-300">
+                {removesFromHistoryOnly
+                  ? "This chat will no longer be listed here. The stored transcript is kept; this removes only its History entry."
+                  : 'This archive will be permanently deleted. This action cannot be undone.'}
               </p>
               <div className="flex gap-2 justify-end">
                 <button
                   onClick={() => setDeleteConfirm(null)}
-                  className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:hover:bg-gray-700"
+                  className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded transition-colors dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
                 >
                   Cancel
                 </button>

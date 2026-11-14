@@ -1,5 +1,7 @@
+import { openClawStatePath } from '../lib/openclaw-profile-paths'
 import { Router, type Request, type Response } from 'express'
 import WebSocket from 'ws'
+import { parseChatJsonBody } from '../lib/chat-request-body'
 import { spawn } from 'child_process'
 import fs from 'fs'
 import path from 'path'
@@ -11,6 +13,7 @@ import { resolveUserExecutionProviderKeys } from '../lib/dashboard-env'
 import { warmDefaultAgentModelEndpoint } from '../lib/agent-default-model'
 import { hasWorkspaceManagedPartnerSecrets, readWorkspaceIntegrationConfig } from '../lib/workspace-integrations'
 import { userExecutionEnv } from '../lib/safe-env'
+import { defaultDashboardChatSeed, readDashboardChatConversations, rememberDashboardConversationSession, type DashboardChatConversations } from '../lib/dashboard-chat-conversations'
 import { recoverRejectedGatewayChat } from '../lib/gateway-chat-recovery'
 import { checkBudgetBlock } from '../lib/budget'
 import { createStreamingWarningFilter, normalizeChatMessage, stripBenignChatRuntimeWarnings } from '../lib/chat-normalization'
@@ -29,6 +32,7 @@ import {
   runExclusiveAgentExecution,
   shouldUseExplicitBackupModelRetry,
   scopeSessionIdToModel,
+  scopeStoredDashboardSessionId,
   toExecutionModelOverride,
   withTemporaryAgentAuthProfiles,
 } from '../lib/agent-execution'
@@ -44,6 +48,7 @@ import { cancelProcessTree, detachProcessStreams, terminateProcessTree } from '.
 import { isAgentDeletionInProgress } from '../lib/agent-lifecycle-state'
 import { assertTemplateRuntimeAdmitted } from '../lib/template-runtime-admission'
 import { executeDevHostSkillChat, isDevHostSkillChatReady } from './dev-host-skill-chat'
+import { checkOpenClawModelSupport } from '../lib/openclaw-model-catalog'
 
 const router = Router()
 const MAX_RETAINED_CHAT_OUTPUT = 2 * 1024 * 1024
@@ -444,7 +449,11 @@ function formatUnsupportedModelError(raw: string, context?: ChatErrorContext): s
   const modelDetail = model ? `: \`${model}\`` : '.'
   const runtimeName = context?.runtimeLabel ? `${context.runtimeLabel} CLI` : 'installed OpenClaw runtime'
   const cause = `The model identifier is not recognized by the ${runtimeName}. It may have been removed or renamed, or it may belong to a provider that is not available in this deployment.`
-  const action = 'Choose a model listed by a configured provider, save the agent, and retry.'
+  // Dated snapshots of an aliased model are the common case: offer the id the runtime does list.
+  const support = context?.runtimeLabel ? undefined : checkOpenClawModelSupport(model)
+  const action = support?.status === 'unsupported' && support.replacement
+    ? `Change the agent's model to \`${support.replacement}\`, a model listed by the installed OpenClaw runtime, save the agent, and retry.`
+    : 'Choose a model listed by a configured provider, save the agent, and retry.'
   const editLink = context?.agentId
     ? ` [Edit agent model](/agents?agent=${encodeURIComponent(context.agentId)}&action=edit)`
     : ''
@@ -462,6 +471,32 @@ const RUNTIME_CHAT_LABELS: Record<'claude' | 'droid', string> = {
 // resolveAgentRuntime()'s own default — never treat "unset" as "non-openclaw".
 function isNonOpenclawChatRuntime(runtime: unknown): runtime is 'claude' | 'droid' {
   return runtime === 'claude' || runtime === 'droid'
+}
+
+/** Distinct messages for the Gateway failures OpenClaw reports. Only the Gateway host, a close
+ * code or an auth code is taken from the raw text; nothing else is echoed. Mirrored in
+ * client/src/lib/chatRuntimeErrors.ts. */
+export function describeGatewayFailure(text: string): string | null {
+  const unreachable = text.match(/Gateway not reachable at (wss?:\/\/[^\s()]+?)\.?(?:\s|\(|$)/i)
+  if (unreachable) {
+    let host = ''
+    try { host = new URL(unreachable[1]).host } catch { /* keep the message generic */ }
+    return `OpenClaw Gateway is not running${host ? ` at ${host}` : ''}, so agent chat cannot start. Restart the Dashboard with SYSTEM/start.sh (it installs and starts a missing Gateway), or run \`openclaw gateway status\`, then retry.`
+  }
+  if (/gateway/i.test(text)) {
+    const authCode = text.match(/\b(?:DEVICE_)?AUTH_[A-Z_]{3,}\b/)?.[0]
+    if (authCode || /gateway token (?:mismatch|missing)|pairing required/i.test(text)) {
+      return `OpenClaw Gateway rejected the Dashboard's connection${authCode ? ` (${authCode})` : ''}. Check that the Dashboard and the Gateway use the same ~/.openclaw/openclaw.json (gateway.auth.token); restart the Gateway if its token changed, then retry.`
+    }
+  }
+  if (/gateway remote mode misconfigured/i.test(text)) {
+    return 'OpenClaw Gateway is set to remote mode without gateway.remote.url. Set gateway.remote.url, or set gateway.mode to local, then retry.'
+  }
+  const closeCode = text.match(/gateway closed \((\d{3,4})\)/i)?.[1]
+  if (closeCode) {
+    return `OpenClaw Gateway closed the connection (code ${closeCode}). It may be restarting; retry in a moment, and run \`openclaw gateway status\` if it continues.`
+  }
+  return null
 }
 
 export function deriveChatError(raw: string, provider?: ChatProvider, context?: ChatErrorContext): string {
@@ -545,6 +580,8 @@ export function deriveChatError(raw: string, provider?: ChatProvider, context?: 
   if (/modelPolicy\.allow/i.test(text) && /not allowed|blocked/i.test(text)) {
     return 'The selected model is blocked by this instance or agent model policy. Ask the instance owner to review the allowed models, or choose an allowed model. This is not a gateway connectivity failure.'
   }
+  const gatewayFailure = describeGatewayFailure(text)
+  if (gatewayFailure) return gatewayFailure
   if (/gateway/i.test(text)) return 'Agent chat could not reach the gateway runtime.'
   if (/timeout/i.test(text)) {
     const modelDetail = context?.model ? ` \`${context.model}\`` : 'The selected model'
@@ -757,12 +794,11 @@ export function evaluateChatExecutionReadiness(
 
 function persistDashboardChatSession(agentId: string, sessionId: string) {
   try {
-    const homeDir = process.env.HOME || ''
-    const nativeStorePath = path.join(homeDir, '.openclaw', 'agents', agentId, 'agent', 'openclaw-agent.sqlite')
+    const nativeStorePath = path.join(openClawStatePath(), 'agents', path.basename(agentId), 'agent', 'openclaw-agent.sqlite')
     if (hasReadyOpenClawNativeAgentStore(nativeStorePath)) return
     const sessionKey = `agent:${agentId}:dashboard-chat`
-    const resolvedSessionId = resolvePersistedAgentSessionId(agentId, sessionKey, sessionId, homeDir) || sessionId
-    const sessionsDir = path.join(homeDir, '.openclaw', 'agents', agentId, 'sessions')
+    const resolvedSessionId = resolvePersistedAgentSessionId(agentId, sessionKey, sessionId) || sessionId
+    const sessionsDir = path.join(openClawStatePath(), 'agents', path.basename(agentId), 'sessions')
     const sessionsPath = path.join(sessionsDir, 'sessions.json')
     if (!fs.existsSync(sessionsDir)) {
       fs.mkdirSync(sessionsDir, { recursive: true })
@@ -880,6 +916,8 @@ export interface AgentChatTransport {
   assertAuthorized(): void
 }
 
+class DashboardConversationChangedError extends Error {}
+
 export async function executeAgentChat(req: Request, res: Response, transport?: AgentChatTransport) {
   const { id } = req.params
   const { message, sessionId, byok } = req.body as {
@@ -921,6 +959,22 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
     return reject(400, readiness.error || 'Agent execution is unavailable')
   }
   const resolvedAgent = readiness.resolvedAgent
+  // The browser's seed names "the dashboard chat with this agent", not a session. Which conversation
+  // that is belongs to the server (dashboard-chat-conversations.ts), so a chat cleared in another
+  // tab, or before a reload, never receives another turn.
+  let dashboardConversation: DashboardChatConversations | undefined
+  try {
+    dashboardConversation = sessionId === defaultDashboardChatSeed(id) ? readDashboardChatConversations(id) : undefined
+  } catch (err) {
+    return reject(500, err instanceof Error ? err.message : String(err))
+  }
+  const assertCurrentDashboardConversation = () => {
+    if (!dashboardConversation) return
+    const current = readDashboardChatConversations(id)
+    if (current.activeSeed !== dashboardConversation.activeSeed || current.activeSessionId !== dashboardConversation.activeSessionId) {
+      throw new DashboardConversationChangedError('The conversation changed while this request was preparing. Send your message again in the current chat.')
+    }
+  }
   const useOpenAiCompatible = resolvedAgent.provider === 'openai-compatible'
   const integrationConfig = readWorkspaceIntegrationConfig()
   const chatCompatibleEndpoint = resolveChatOpenAiCompatibleEndpoint(byok)
@@ -947,7 +1001,13 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
     executionEnv.CLAWMAX_MAIL_BROKER_TOKEN = brokerCapability
     executionEnv.CLAWMAX_MAIL_BROKER_URL = `http://127.0.0.1:${process.env.DASHBOARD_PORT || '3001'}/api/runtime/mail`
   }
-  const sessionSeed = sessionId || buildDashboardChatSeed(id, resolvedAgent.workspace)
+  const sessionSeed = dashboardConversation?.activeSeed || sessionId || buildDashboardChatSeed(id, resolvedAgent.workspace)
+  // A resumed conversation runs its exact session, even if the agent's model has changed since.
+  const resumedSessionId = dashboardConversation?.activeSessionId && (!dashboardConversation.activeSessionModel || dashboardConversation.activeSessionModel === resolvedAgent.model)
+    ? dashboardConversation.activeSessionId : undefined
+  // A seed the server chose (the conversation record's, or its own default) may name a chat stored
+  // under the older, shorter session-key digest; only those may continue such a session.
+  const serverOwnedSeed = Boolean(dashboardConversation) || !sessionId
 
   console.log(`[Chat Route] Starting CLI chat for agent ${id}`)
 
@@ -972,7 +1032,9 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
   }, 2000)
   const chatStartedAt = Date.now()
   const dashboardSessionKey = `agent:${id}:dashboard-chat`
-  let currentSessionId = scopeSessionIdToModel(sessionSeed, resolvedAgent.model)
+  let currentSessionId = resumedSessionId || (serverOwnedSeed
+    ? scopeStoredDashboardSessionId(id, sessionSeed, resolvedAgent.model)
+    : scopeSessionIdToModel(sessionSeed, resolvedAgent.model))
   let chatSessionRetryAttempt = 0
 
   // Use plain-text mode so stdout can stream deltas to the UI in real time.
@@ -1049,6 +1111,7 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
     // this branch used to, made it invisible to both.
     await withRegisteredTurn(id, async () => {
       try {
+        assertCurrentDashboardConversation()
         transport?.assertAuthorized()
         const result = await executeClawmaxResendSend({
           to: dispatch.to,
@@ -1089,6 +1152,7 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
   // the chance to forget it on whatever exit path gets added next.
   withRegisteredTurn(id, async (turn) => {
     turnId = turn.turnId
+    assertCurrentDashboardConversation()
 
     // No route-level deadline. Every previous bound measured silence, and silence is what a working
     // agent produces while it thinks and runs tools -- a measured research turn went quiet for 316s
@@ -1105,6 +1169,7 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
       const executionSessionId = currentSessionId
 
       await runExclusiveAgentExecution(id, async () => {
+        assertCurrentDashboardConversation()
         if (!isRequestedChatAgentCurrent(req, id)) {
           throw new Error('Agent was deleted or replaced. Close this chat and refresh Agents.')
         }
@@ -1202,10 +1267,12 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
         forceGateway = false,
       ) => {
         const attemptSessionSeed = buildDashboardChatRetrySeed(sessionSeed, chatSessionRetryAttempt)
-        const executionSessionId = scopeSessionIdToModel(
-          attemptSessionSeed,
-          attemptModel,
-        )
+        // Recovery and backup-model attempts keep their own sessions, as they always have.
+        const executionSessionId = resumedSessionId && chatSessionRetryAttempt === 0 && attemptModel === resolvedAgent.model
+          ? resumedSessionId
+          : serverOwnedSeed && chatSessionRetryAttempt === 0
+            ? scopeStoredDashboardSessionId(id, attemptSessionSeed, attemptModel)
+            : scopeSessionIdToModel(attemptSessionSeed, attemptModel)
         currentSessionId = executionSessionId
         // The reply already persisted before this attempt, so recovery below never mistakes it for
         // this attempt's answer.
@@ -1271,7 +1338,14 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
             proc = spawned
             procExited = false
 
-            send('start', { sessionId: executionSessionId, resumeSessionId: attemptSessionSeed, turnId: turn.turnId })
+            // The panel sends `resumeSessionId` with its next turn. A first attempt hands back what the
+            // panel sent, so a dashboard chat keeps asking for its current conversation; only a
+            // recovery seed (a locked session) is handed out for it to keep.
+            send('start', {
+              sessionId: executionSessionId,
+              resumeSessionId: dashboardConversation ? defaultDashboardChatSeed(id) : chatSessionRetryAttempt > 0 ? attemptSessionSeed : (sessionId || attemptSessionSeed),
+              turnId: turn.turnId,
+            })
             invalidateAgentStatusCache(id)
 
             /**
@@ -1440,6 +1514,7 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
       }
 
       await runExclusiveAgentExecution(id, async () => {
+        assertCurrentDashboardConversation()
         if (!isRequestedChatAgentCurrent(req, id)) {
           throw new Error('Agent was deleted or replaced. Close this chat and refresh Agents.')
         }
@@ -1497,6 +1572,12 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
           console.warn(`[Chat Route] Recovering agent ${id} with a fresh chat session after an OpenClaw session conflict`)
         },
       }).then((attemptResult) => {
+        if (dashboardConversation && attemptResult.completionText && !attemptResult.incompleteReason && (chatSessionRetryAttempt > 0 || attemptResult.model !== resolvedAgent.model)) {
+          if (!attemptResult.sessionId) throw new Error('The recovered reply did not identify its conversation. Refresh chat before sending again.')
+          const conversationModel = resolvedAgent.model || attemptResult.model
+          if (!conversationModel) throw new Error('The recovered reply did not identify its model. Refresh chat before sending again.')
+          rememberDashboardConversationSession(id, dashboardConversation, attemptResult.sessionId, conversationModel)
+        }
         clearInterval(keepalive)
         if (attemptResult.incompleteReason) {
           send('error', attemptResult.incompleteReason)
@@ -1551,7 +1632,7 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
     // withRegisteredTurn's `finally`, and this route would be back to leaking on an exit path.
     console.error(`[Chat Route] Unexpected error running chat turn for ${id}:`, err)
     clearInterval(keepalive)
-    send('error', 'Agent execution failed')
+    send('error', err instanceof DashboardConversationChangedError ? err.message : 'Agent execution failed')
     if (!res.writableEnded) res.end()
   })
 
@@ -1576,7 +1657,9 @@ export async function executeAgentChat(req: Request, res: Response, transport?: 
   })
 }
 
-router.post('/:id/chat', (req, res, next) => {
+// A send carries the last few messages as context and one reply may be up to 2 MB, far over the app's 100 KB
+// default (which skips this path, see server/index.ts). Parsed here, behind the router's authentication.
+router.post('/:id/chat', parseChatJsonBody, (req, res, next) => {
   if (isDevHostSkillChatReady(req, req.params.id)) return executeDevHostSkillChat(req, res).catch(next)
   return executeAgentChat(req, res).catch(next)
 })

@@ -58,9 +58,7 @@ for channel in whatsapp discord telegram slack; do
 done
 assert_contains "ARG BUILDPLATFORM"
 assert_contains "ARG TARGETPLATFORM"
-assert_contains "FROM --platform=\$BUILDPLATFORM node:24.19.0-bookworm-slim AS openclaw-builder"
-assert_contains "FROM --platform=\$BUILDPLATFORM node:24.19.0-bookworm-slim AS builder"
-assert_contains "FROM --platform=\$TARGETPLATFORM node:24.19.0-bookworm-slim AS runtime"
+node "$ROOT_DIR/SYSTEM/node-runtime-pin.cjs"
 assert_contains "    gpg \\"
 assert_contains "COPY SYSTEM/install-1password-cli.sh ./SYSTEM/install-1password-cli.sh"
 assert_contains "RUN command -v gpg >/dev/null && sh -n ./SYSTEM/install-1password-cli.sh"
@@ -74,6 +72,8 @@ assert_contains 'npm install -g --include=optional "@openai/codex@${OPENCLAW_COD
 assert_contains "require('/usr/local/lib/node_modules/@openai/codex/package.json').version"
 assert_contains 'codex --version | grep -F "${OPENCLAW_CODEX_APP_SERVER_VERSION}"'
 assert_contains "ENV OPENCLAW_CODEX_APP_SERVER_BIN=/usr/local/bin/codex"
+assert_contains "COPY SYSTEM/cognee-bundle/harden.cjs /opt/clawmax-cognee/harden.cjs"
+assert_contains "RUN node /opt/clawmax-cognee/harden.cjs"
 assert_contains 'ENV OPENCLAW_CODEX_APP_SERVER_VERSION=${OPENCLAW_CODEX_APP_SERVER_VERSION}'
 assert_contains "ARG QBO_VERSION=0.6.1"
 assert_contains "ARG QBO_LINUX_AMD64_SHA256=ce7774c7c641b1c6fe356e2e522465fbf16d80bce0a87fd2c8027774e2a46f31"

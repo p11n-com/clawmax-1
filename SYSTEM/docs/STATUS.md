@@ -4,9 +4,39 @@
 
 **Development Line**: 2.0.0
 
-**Last Updated**: October 12, 2026
+**Last Updated**: November 14, 2026
 
-**Status**: `v1.9.9` remains stable. `v2.0.0-test-rc91` is the latest tagged test candidate in this checkout, not a stable release. [PR #212](https://github.com/Maximilien-ai/clawmax/pull/212) is open for owner-scoped inert Template staging and dev-only chat; it does not establish public Template Workflow execution. MBP14 reported an installed RC91 chat/plugin compatibility failure, while test10 acceptance on the same next candidate is not yet recorded. The [active dual-instance gate](planning/DASHBOARD_2_0_DUAL_INSTANCE_GATE_2026-10-12.md) separates source, images, deployment, and user acceptance.
+**Status**: `v1.9.9` remains stable. #227 is accepted and merged on main as
+`9ad021b0`, after final CI and 574/574 local chat-source checks. RC98 has not been
+cut. CI updates #294 (`2f62920a`), #297 (`5ebca2ad`) and #295 (`4e4c11ef`)
+are merged after green checks. #300 (`2337cd96`) also merged after full CI.
+#299 (`4dffd39c`) and #301 (`513349eb`) also merged after required CI and
+CodeQL. #303 merged as `cbd1ee68` after **577/577** final local checks and green
+required CI/CodeQL; the live chat context test fix is now on main. #302 merged as
+`2979a628` after green required CI/CodeQL and the owner merge. #384 merged as
+`d9d87c50` after 581/581 final local checks, registry-preservation verification,
+Linux runtime/build probes and green CI/CodeQL. Node 24.22, ZIP promotion and unit
+fixture isolation are on main. #298 merged as `a9626631` after **582/582** local
+checks and green CI/CodeQL; main dependencies are synchronized. Strict frontend
+typing retains 290 baseline diagnostics with none added. The final Dependabot
+PR, #296, is under review: optional-memory compatibility, patched transport and a
+fail-closed restriction on new offline capture replay. Consent-bound replay
+remains tracked in #419; tracing migration remains in #418. [Impact-based CI](CI_TEST_SCOPE.md) preserves required checks
+while limiting workflow/docs-only changes to focused validation. Current work is the [November 14 dependency queue](planning/DEPENDABOT_2026-11-14.md),
+with initial classification of all 107 starting issues complete (#273 closed,
+106 remain open, none unlabelled). Current-source closure and feedback-topic
+verification remain. Installed/provider, security and final
+public/private image validation remain open; no new deployment is claimed.
+
+## Historical RC95 source preview on October 27
+
+[Draft PR #304](https://github.com/Maximilien-ai/clawmax/pull/304) combines 13 of
+Daniyar's 17 reviewed PRs (all eight new #320–#327 included) on `integration/rc95-daniyar`, with four held for
+lifecycle evidence. Acceptance fixes now cover save-ready AI workflows, AI group/community drafts, and refreshed open agent details. The final local integration/validation/coverage suite passes 557/557. Review now ships the RC95 checklist and explicit email submission with retained delivery evidence; live-provider acceptance remains open. See the
+[RC95 acceptance file](planning/RC95_PREVIEW_ACCEPTANCE_2026-10-27.md) for the exact
+source, engineering limitations, CI/security gate and twelve independent reviewer
+checks. Main contains merged RC94 PR #291; this preview has not landed on main.
+The existing RC94 images are unchanged; RC95 has no release tag or image yet.
 
 ## Earlier release evidence (retained history)
 

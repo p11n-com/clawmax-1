@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { readChatComposerExpanded, saveChatComposerExpanded } from '../lib/chatComposerSize'
 import {
   canRestoreChatArchive,
   formatChatArchiveTimestamp,
@@ -27,7 +28,7 @@ interface Props {
 export default function ChatPanel({ agentId, agentName, onClose }: Props) {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
-  const [composerExpanded, setComposerExpanded] = useState(false)
+  const [composerExpanded, setComposerExpanded] = useState(readChatComposerExpanded)
   const [loading, setLoading] = useState(true)
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -343,13 +344,13 @@ export default function ChatPanel({ agentId, agentName, onClose }: Props) {
             />
             <button
               type="button"
-              onClick={() => { if (inputRef.current) inputRef.current.style.height = ''; setComposerExpanded(value => !value) }}
+              onClick={() => { if (inputRef.current) inputRef.current.style.height = ''; const next = !composerExpanded; saveChatComposerExpanded(next); setComposerExpanded(next) }}
               className="absolute right-2 top-1.5 rounded p-1 text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700"
               aria-label={composerExpanded ? 'Collapse message box' : 'Expand message box'}
               title={composerExpanded ? 'Collapse message box' : 'Expand message box'}
               aria-expanded={composerExpanded}
             >
-              <svg className={`h-4 w-4 transition-transform ${composerExpanded ? 'rotate-180' : ''}`} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m5 7 5 5 5-5" /></svg>
+              <svg className={`h-4 w-4 transition-transform ${composerExpanded ? '' : 'rotate-180'}`} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m5 7 5 5 5-5" /></svg>
             </button>
             </div>
             <button
